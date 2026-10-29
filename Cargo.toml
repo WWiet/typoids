@@ -1,0 +1,18 @@
+[package]
+name = "typoids"
+version = "0.1.0"
+edition = "2021"
+description = "Typing asteroids in the terminal"
+publish = false
+license = "MIT"
+
+[[bin]]
+name = "typoids"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+
+[profile.release]
+lto = true
+codegen-units = 1
