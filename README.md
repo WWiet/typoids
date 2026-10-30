@@ -1,6 +1,6 @@
 # TYPOIDS
 
-TYPOIDS is Asteroids with words on the hazards. Two themes are included: the original space field with a spaceship and asteroids, and an underwater field with a submarine and spiked sea mines. Type a word, the ship turns, fires, and blows that hazard apart.
+TYPOIDS is Asteroids with words on the hazards. Three themes are included: the original space field with a spaceship and asteroids, an underwater field with a submarine and spiked sea mines, and a jungle canopy where falling leaves and fireflies drift past a banana-throwing monkey and its coconuts. Type a word, the ship turns, fires, and blows that hazard apart.
 
 This is a terminal game (ratatui). It is meant to be played in your own terminal, not in a browser.
 
@@ -16,10 +16,12 @@ Rust 1.75 or newer. The terminal should be at least 70×22 and speak UTF-8 (brai
 ## Play
 
 - At the title menu, use `h`/`j`/`k`/`l` or the arrow keys to pick Start, Themes, or Quit, then press Enter. `Q` also quits.
-- Choose Themes to switch between Space and Underwater. `h`/`l` or the arrow keys move the highlight, Enter applies the theme, and Esc backs out without changing it.
+- Choose Themes to switch between Space, Underwater, and Jungle. `h`/`l` or the arrow keys move the highlight, Enter applies the theme, and Esc backs out without changing it.
 - Type the word under a hazard. The first letters lock the nearest match; the ship turns to face it.
-- Each correct letter fires a shot or torpedo and shoves the ship. Finishing the word detonates the hazard.
+- Each correct letter fires a shot, torpedo, or banana and shoves the ship. Finishing the word detonates the hazard.
 - Wrong letters are ignored (the buffer does not change).
-- Backspace erases. Esc pauses. On the title, pause, or game over, Q quits.
+- Backspace erases. Esc opens the pause popup, where you can Continue, Restart, or Quit. Quit returns to the title screen. Use `h`/`j`/`k`/`l` or the arrow keys to choose, Enter to select, and Esc to resume.
+- When a run ends, the game-over popup offers Play Again, Themes, or Quit. Play Again is selected by default, so pressing Enter starts a new run immediately. Themes works the same as on the title screen.
+- `Q` returns to the title from the pause popup, and quits the game from the title or game-over popups.
 - Hazards that reach the ship cost a life. The ship is briefly invulnerable afterward and hazards pass through it during that time. Three lives, then the wave starts over.
 - Best score is remembered in `~/.typoids-best`.

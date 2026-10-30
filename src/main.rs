@@ -5,7 +5,10 @@ mod words;
 use std::io::Result;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use game::{Game, Phase, MENU_QUIT, MENU_START, MENU_THEMES};
+use game::{
+    Game, Phase, MENU_QUIT, MENU_START, MENU_THEMES, OVER_AGAIN, OVER_QUIT, OVER_THEMES,
+    PAUSE_CONTINUE, PAUSE_QUIT, PAUSE_RESTART,
+};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 fn main() -> Result<()> {
@@ -66,18 +69,7 @@ fn on_key(game: &mut Game, code: KeyCode, mods: KeyModifiers) {
         return;
     }
     match game.phase {
-        Phase::Title if game.theme_menu_open => match code {
-            KeyCode::Char('j' | 'J' | 'l' | 'L') | KeyCode::Down | KeyCode::Right => {
-                game.theme_move(1);
-            }
-            KeyCode::Char('k' | 'K' | 'h' | 'H') | KeyCode::Up | KeyCode::Left => {
-                game.theme_move(-1);
-            }
-            KeyCode::Enter => game.apply_theme(),
-            KeyCode::Esc => game.close_themes(),
-            KeyCode::Char('q' | 'Q') => game.quit = true,
-            _ => {}
-        },
+        Phase::Title if game.theme_menu_open => theme_keys(game, code),
         Phase::Title => match code {
             KeyCode::Char('j' | 'J' | 'l' | 'L') | KeyCode::Down | KeyCode::Right => {
                 game.menu_move(1);
@@ -95,21 +87,60 @@ fn on_key(game: &mut Game, code: KeyCode, mods: KeyModifiers) {
             _ => {}
         },
         Phase::Playing => match code {
-            KeyCode::Esc => game.phase = Phase::Paused,
+            KeyCode::Esc => game.pause(),
             KeyCode::Backspace => game.backspace(),
             KeyCode::Char(c) if c.is_ascii_alphabetic() => game.type_char(c),
             _ => {}
         },
+        Phase::Paused | Phase::GameOver if game.theme_menu_open => theme_keys(game, code),
         Phase::Paused => match code {
-            KeyCode::Esc | KeyCode::Enter => game.phase = Phase::Playing,
-            KeyCode::Char('q' | 'Q') => game.quit = true,
+            KeyCode::Char('j' | 'J' | 'l' | 'L') | KeyCode::Down | KeyCode::Right => {
+                game.menu_move(1);
+            }
+            KeyCode::Char('k' | 'K' | 'h' | 'H') | KeyCode::Up | KeyCode::Left => {
+                game.menu_move(-1);
+            }
+            KeyCode::Esc => game.resume(),
+            KeyCode::Enter => match game.menu {
+                PAUSE_CONTINUE => game.resume(),
+                PAUSE_RESTART => game.start(),
+                PAUSE_QUIT => game.return_to_title(),
+                _ => {}
+            },
+            KeyCode::Char('q' | 'Q') => game.return_to_title(),
             _ => {}
         },
         Phase::GameOver => match code {
-            KeyCode::Enter => game.start(),
+            KeyCode::Char('j' | 'J' | 'l' | 'L') | KeyCode::Down | KeyCode::Right => {
+                game.menu_move(1);
+            }
+            KeyCode::Char('k' | 'K' | 'h' | 'H') | KeyCode::Up | KeyCode::Left => {
+                game.menu_move(-1);
+            }
+            KeyCode::Enter => match game.menu {
+                OVER_AGAIN => game.start(),
+                OVER_THEMES => game.open_themes(),
+                OVER_QUIT => game.quit = true,
+                _ => {}
+            },
             KeyCode::Char('q' | 'Q') => game.quit = true,
             _ => {}
         },
         Phase::Dying => {}
+    }
+}
+
+fn theme_keys(game: &mut Game, code: KeyCode) {
+    match code {
+        KeyCode::Char('j' | 'J' | 'l' | 'L') | KeyCode::Down | KeyCode::Right => {
+            game.theme_move(1);
+        }
+        KeyCode::Char('k' | 'K' | 'h' | 'H') | KeyCode::Up | KeyCode::Left => {
+            game.theme_move(-1);
+        }
+        KeyCode::Enter => game.apply_theme(),
+        KeyCode::Esc => game.close_themes(),
+        KeyCode::Char('q' | 'Q') => game.quit = true,
+        _ => {}
     }
 }

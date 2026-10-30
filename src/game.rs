@@ -13,19 +13,31 @@ pub const MENU_START: usize = 0;
 pub const MENU_THEMES: usize = 1;
 pub const MENU_QUIT: usize = 2;
 
+pub const PAUSE_ITEMS: &[&str] = &["CONTINUE", "RESTART", "QUIT"];
+pub const PAUSE_CONTINUE: usize = 0;
+pub const PAUSE_RESTART: usize = 1;
+pub const PAUSE_QUIT: usize = 2;
+
+pub const OVER_ITEMS: &[&str] = &["PLAY AGAIN", "THEMES", "QUIT"];
+pub const OVER_AGAIN: usize = 0;
+pub const OVER_THEMES: usize = 1;
+pub const OVER_QUIT: usize = 2;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
     Space,
     Underwater,
+    Jungle,
 }
 
 impl Theme {
-    pub const ALL: [Theme; 2] = [Theme::Space, Theme::Underwater];
+    pub const ALL: [Theme; 3] = [Theme::Space, Theme::Underwater, Theme::Jungle];
 
     pub fn label(self) -> &'static str {
         match self {
             Theme::Space => "SPACE",
             Theme::Underwater => "UNDERWATER",
+            Theme::Jungle => "JUNGLE",
         }
     }
 
@@ -33,6 +45,7 @@ impl Theme {
         match self {
             Theme::Space => 0,
             Theme::Underwater => 1,
+            Theme::Jungle => 2,
         }
     }
 
@@ -135,6 +148,7 @@ pub struct Star {
     pub x: f32,
     pub y: f32,
     pub glyph: char,
+    pub phase: f32,
 }
 
 pub struct Game {
@@ -377,8 +391,31 @@ impl Game {
     }
 
     pub fn menu_move(&mut self, delta: isize) {
-        let len = MENU_ITEMS.len() as isize;
+        let len = self.menu_items().len() as isize;
         self.menu = (self.menu as isize + delta).rem_euclid(len) as usize;
+    }
+
+    /// The choices shown for the current phase. The title and the two popups
+    /// all share the same `menu` index, but each has its own wording.
+    pub fn menu_items(&self) -> &'static [&'static str] {
+        match self.phase {
+            Phase::Paused => PAUSE_ITEMS,
+            Phase::GameOver => OVER_ITEMS,
+            _ => MENU_ITEMS,
+        }
+    }
+
+    pub fn pause(&mut self) {
+        if self.phase == Phase::Playing {
+            self.phase = Phase::Paused;
+            self.menu = PAUSE_CONTINUE;
+        }
+    }
+
+    pub fn resume(&mut self) {
+        if self.phase == Phase::Paused {
+            self.phase = Phase::Playing;
+        }
     }
 
     pub fn open_themes(&mut self) {
@@ -388,6 +425,9 @@ impl Game {
 
     pub fn close_themes(&mut self) {
         self.theme_menu_open = false;
+        if self.phase == Phase::GameOver {
+            self.menu = OVER_AGAIN;
+        }
     }
 
     pub fn theme_move(&mut self, delta: isize) {
@@ -398,11 +438,29 @@ impl Game {
     pub fn apply_theme(&mut self) {
         self.theme = Theme::from_index(self.theme_choice);
         self.theme_menu_open = false;
+        if self.phase == Phase::GameOver {
+            self.menu = OVER_AGAIN;
+        }
         self.reseed_stars();
     }
 
     pub fn start(&mut self) {
         self.phase = Phase::Playing;
+        self.theme_menu_open = false;
+        self.reset_run();
+        self.begin_wave();
+    }
+
+    /// Abandon the current run and go back to the title screen.
+    pub fn return_to_title(&mut self) {
+        self.phase = Phase::Title;
+        self.menu = MENU_START;
+        self.theme_menu_open = false;
+        self.reset_run();
+        self.seed_title();
+    }
+
+    fn reset_run(&mut self) {
         self.rocks.clear();
         self.effects.clear();
         self.buffer.clear();
@@ -415,13 +473,18 @@ impl Game {
         self.ox = 0.0;
         self.oy = 0.0;
         self.thrust = 0.0;
+        self.spin = 0.0;
         self.angle = 0.0;
         self.invuln = 0.0;
         self.dying = 0.0;
         self.pending_clear = false;
         self.miss = 0.0;
         self.hurt = 0.0;
-        self.begin_wave();
+        self.shake = 0.0;
+        self.shake_x = 0.0;
+        self.shake_y = 0.0;
+        self.banner.clear();
+        self.banner_t = 0.0;
     }
 
     pub fn type_char(&mut self, c: char) {
@@ -483,6 +546,7 @@ impl Game {
                 self.dying -= dt;
                 if self.dying <= 0.0 {
                     self.phase = Phase::GameOver;
+                    self.menu = OVER_AGAIN;
                     self.save_best();
                 }
             }
@@ -549,6 +613,7 @@ impl Game {
             self.banner = match self.theme {
                 Theme::Space => "WAVE CLEAR".to_string(),
                 Theme::Underwater => "MINEFIELD CLEAR".to_string(),
+                Theme::Jungle => "CANOPY CLEAR".to_string(),
             };
             self.banner_t = 1.45;
             self.buffer.clear();
@@ -713,6 +778,8 @@ impl Game {
                 (Theme::Space, false) => '+',
                 (Theme::Underwater, true) => '°',
                 (Theme::Underwater, false) => '·',
+                (Theme::Jungle, true) => '✦',
+                (Theme::Jungle, false) => '·',
             },
         });
         if let Some(rock) = self.rocks.iter_mut().find(|r| r.id == id) {
@@ -868,6 +935,61 @@ impl Game {
                     });
                 }
             }
+            Theme::Jungle => {
+                // A coconut cracking open scatters husk and leaves.
+                for i in 0..2 {
+                    let life = 0.34 + i as f32 * 0.12;
+                    self.effects.push(Effect::Ring {
+                        x,
+                        y,
+                        r: radius * (0.3 + i as f32 * 0.3),
+                        vr: 12.0 + i as f32 * 4.0,
+                        life,
+                        max: life,
+                    });
+                }
+                let glyphs = ['✦', '·', 'o', '(', ')', '*'];
+                for i in 0..20 {
+                    let a = (i as f32 / 20.0) * TAU + self.rng.range(-0.25, 0.25);
+                    let sp = self.rng.range(5.0, 14.0);
+                    self.effects.push(Effect::Spark {
+                        x: x + a.cos() * radius * 0.28,
+                        y: y + a.sin() * radius * 0.28,
+                        vx: a.cos() * sp,
+                        vy: a.sin() * sp - self.rng.range(0.5, 3.0),
+                        life: self.rng.range(0.32, 0.72),
+                        max: 0.72,
+                        glyph: glyphs[(self.rng.next() as usize) % glyphs.len()],
+                    });
+                }
+                for (i, ch) in word.chars().enumerate() {
+                    let a = (i as f32 / word.len().max(1) as f32) * TAU;
+                    let sp = self.rng.range(4.0, 11.0);
+                    self.effects.push(Effect::Spark {
+                        x,
+                        y,
+                        vx: a.cos() * sp,
+                        vy: a.sin() * sp - 2.4,
+                        life: 0.75,
+                        max: 0.75,
+                        glyph: ch,
+                    });
+                }
+                for i in 0..9 {
+                    let a = (i as f32 / 9.0) * TAU;
+                    self.effects.push(Effect::Shard {
+                        x,
+                        y,
+                        vx: a.cos() * self.rng.range(4.0, 11.0),
+                        vy: a.sin() * self.rng.range(4.0, 11.0),
+                        rot: a,
+                        spin: self.rng.range(-8.0, 8.0),
+                        len: self.rng.range(0.5, 1.4),
+                        life: self.rng.range(0.3, 0.65),
+                        max: 0.65,
+                    });
+                }
+            }
         }
         while self.effects.len() > 240 {
             self.effects.remove(0);
@@ -905,6 +1027,7 @@ impl Game {
             self.banner = match self.theme {
                 Theme::Space => "SHIP LOST".to_string(),
                 Theme::Underwater => "HULL BREACH".to_string(),
+                Theme::Jungle => "MONKEY DOWN".to_string(),
             };
             self.banner_t = 0.95;
         }
@@ -950,12 +1073,26 @@ impl Game {
     }
 
     fn make_rock(&mut self, x: f32, y: f32, radius: f32, word: String) -> Rock {
-        let n = 8 + (self.rng.next() as usize % 4);
+        let coconut = self.theme == Theme::Jungle;
+        let n = if coconut {
+            12
+        } else {
+            8 + (self.rng.next() as usize % 4)
+        };
         let mut shape = Vec::with_capacity(n);
         for i in 0..n {
-            let jitter = self.rng.range(-0.22, 0.22);
+            let jitter = if coconut {
+                self.rng.range(-0.06, 0.06)
+            } else {
+                self.rng.range(-0.22, 0.22)
+            };
             let a = (i as f32 + jitter) / n as f32 * TAU;
-            let r = radius * self.rng.range(0.72, 1.12);
+            let r = radius
+                * if coconut {
+                    self.rng.range(0.94, 1.04)
+                } else {
+                    self.rng.range(0.72, 1.12)
+                };
             shape.push((a.cos() * r, a.sin() * r));
         }
         let id = self.next_id;
@@ -1049,6 +1186,7 @@ impl Game {
         let period = match self.theme {
             Theme::Space => 0.028,
             Theme::Underwater => 0.032,
+            Theme::Jungle => 0.05,
         };
         while self.exhaust > period {
             self.exhaust -= period;
@@ -1075,6 +1213,17 @@ impl Game {
                         life: self.rng.range(0.18, 0.38),
                         max: 0.38,
                         glyph: if self.rng.f32() < 0.72 { '°' } else { '·' },
+                    });
+                }
+                Theme::Jungle => {
+                    self.effects.push(Effect::Spark {
+                        x: sx - fx * 1.05 + px,
+                        y: sy - fy * 1.05 + py,
+                        vx: -fx * self.rng.range(2.5, 6.0) + self.rng.range(-1.2, 1.2),
+                        vy: -fy * self.rng.range(2.5, 6.0) + self.rng.range(-1.2, 1.2) - 0.8,
+                        life: self.rng.range(0.22, 0.46),
+                        max: 0.46,
+                        glyph: if self.rng.f32() < 0.7 { '·' } else { '✦' },
                     });
                 }
             }
@@ -1153,8 +1302,18 @@ impl Game {
 
     fn reseed_stars(&mut self) {
         self.stars.clear();
-        let count = ((self.play_w * self.play_h) / 22.0) as usize;
-        for _ in 0..count.min(360) {
+        let density = if self.theme == Theme::Jungle {
+            170.0
+        } else {
+            22.0
+        };
+        let count = ((self.play_w * self.play_h) / density) as usize;
+        let cap = if self.theme == Theme::Jungle {
+            50
+        } else {
+            360
+        };
+        for _ in 0..count.min(cap) {
             let glyph = match self.theme {
                 Theme::Space => {
                     if self.rng.f32() < 0.82 {
@@ -1173,11 +1332,22 @@ impl Game {
                         '∘'
                     }
                 }
+                Theme::Jungle => {
+                    let roll = self.rng.f32();
+                    if roll < 0.16 {
+                        '✦'
+                    } else if roll < 0.56 {
+                        '❧'
+                    } else {
+                        ','
+                    }
+                }
             };
             self.stars.push(Star {
                 x: self.rng.range(0.0, self.play_w),
                 y: self.rng.range(0.0, self.play_h),
                 glyph,
+                phase: self.rng.range(0.0, TAU),
             });
         }
     }
@@ -1255,6 +1425,69 @@ mod tests {
     }
 
     #[test]
+    fn pause_menu_defaults_to_continue() {
+        let mut g = playing();
+        g.pause();
+        assert_eq!(g.phase, Phase::Paused);
+        assert_eq!(g.menu, PAUSE_CONTINUE);
+        assert_eq!(g.menu_items(), PAUSE_ITEMS);
+        g.menu_move(1);
+        assert_eq!(g.menu, PAUSE_RESTART);
+        g.menu_move(1);
+        assert_eq!(g.menu, PAUSE_QUIT);
+        g.menu_move(1);
+        assert_eq!(g.menu, PAUSE_CONTINUE);
+        g.resume();
+        assert_eq!(g.phase, Phase::Playing);
+    }
+
+    #[test]
+    fn returning_to_title_resets_the_run() {
+        let mut g = playing();
+        g.score = 1234;
+        g.wave = 3;
+        g.lives = 1;
+        g.buffer = "ab".into();
+        g.return_to_title();
+        assert_eq!(g.phase, Phase::Title);
+        assert_eq!(g.menu, MENU_START);
+        assert!(!g.quit);
+        assert_eq!(g.score, 0);
+        assert_eq!(g.wave, 1);
+        assert_eq!(g.lives, 3);
+        assert!(g.buffer.is_empty());
+        assert!(!g.rocks.is_empty());
+    }
+
+    #[test]
+    fn game_over_menu_defaults_to_play_again() {
+        let mut g = playing();
+        g.phase = Phase::Dying;
+        g.dying = 0.01;
+        g.update(0.05);
+        assert_eq!(g.phase, Phase::GameOver);
+        assert_eq!(g.menu, OVER_AGAIN);
+        assert_eq!(g.menu_items(), OVER_ITEMS);
+        g.menu_move(-1);
+        assert_eq!(g.menu, OVER_QUIT);
+        g.menu_move(-1);
+        assert_eq!(g.menu, OVER_THEMES);
+        g.menu_move(-1);
+        assert_eq!(g.menu, OVER_AGAIN);
+    }
+
+    #[test]
+    fn closing_themes_from_game_over_resets_to_play_again() {
+        let mut g = playing();
+        g.phase = Phase::GameOver;
+        g.menu = OVER_THEMES;
+        g.open_themes();
+        g.close_themes();
+        assert!(!g.theme_menu_open);
+        assert_eq!(g.menu, OVER_AGAIN);
+    }
+
+    #[test]
     fn theme_selection_applies_and_closes() {
         let mut g = Game::new(100, 40, 42);
         assert_eq!(g.theme, Theme::Underwater);
@@ -1263,18 +1496,26 @@ mod tests {
         assert_eq!(g.theme_choice, Theme::Underwater.index());
 
         g.theme_move(1);
+        assert_eq!(g.theme_choice, Theme::Jungle.index());
+        g.apply_theme();
+        assert_eq!(g.theme, Theme::Jungle);
+        assert!(!g.theme_menu_open);
+        assert!(g.stars.iter().any(|s| s.glyph == '✦'));
+
+        g.open_themes();
+        assert_eq!(g.theme_choice, Theme::Jungle.index());
+        g.theme_move(1);
         assert_eq!(g.theme_choice, Theme::Space.index());
         g.apply_theme();
         assert_eq!(g.theme, Theme::Space);
-        assert!(!g.theme_menu_open);
-        assert!(g.stars.iter().any(|s| s.glyph == '.' || s.glyph == '+'));
+        assert!(g.stars.iter().any(|s| s.glyph == '+'));
 
         g.open_themes();
-        g.theme_move(-1);
+        g.theme_move(1);
         assert_eq!(g.theme_choice, Theme::Underwater.index());
         g.apply_theme();
         assert_eq!(g.theme, Theme::Underwater);
-        assert!(g.stars.iter().any(|s| matches!(s.glyph, '·' | '°' | '∘')));
+        assert!(g.stars.iter().any(|s| matches!(s.glyph, '°' | '∘')));
     }
 
     #[test]
