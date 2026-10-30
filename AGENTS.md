@@ -80,7 +80,7 @@ are siblings and may use `crate::game::...`, `crate::draw::...`, etc.
 - `draw::draw(frame, game)` paints the background first, then returns early with
   a resize message below `48x18`; the intended full layout is at least `70x22`.
   Keep the small-terminal path working.
-- Each theme has a `Palette` const (`SPACE`, `UNDERWATER`, `JUNGLE`). Reuse
+- Each theme has a `Palette` const (`SPACE`, `UNDERWATER`, `JUNGLE`, `CAT_CAFE`). Reuse
   palette fields instead of hardcoding colors in new UI.
 - Braille art goes through `InkLayer`:
   - World units are terminal cells: 1 unit = 2 braille pixels in x and 4 in y.
@@ -140,7 +140,7 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
   helper and assert on the resulting text (e.g. menu labels and hint copy).
   Add a render assertion when you add player-visible strings or theme visuals.
 - Every behavior change should add or update a focused test. Keep the suite
-  green; currently 18 tests.
+  green; currently 21 tests.
 
 ## Gotchas
 

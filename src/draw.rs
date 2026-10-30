@@ -2,7 +2,8 @@
 //! braille line art; words sit on top in plain cells so they stay readable.
 
 use crate::game::{
-    metrics, rotate, spaceship_local, submarine_local, Effect, Game, Phase, Theme, MENU_ITEMS,
+    cat_local, metrics, rotate, spaceship_local, submarine_local, Effect, Game, Phase, Theme,
+    MENU_ITEMS,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -74,11 +75,28 @@ const JUNGLE: Palette = Palette {
     faint: Color::Rgb(72, 112, 70),
 };
 
+const CAT_CAFE: Palette = Palette {
+    bg_top: Color::Rgb(24, 16, 12),
+    bg_bottom: Color::Rgb(12, 8, 6),
+    dim: Color::Rgb(175, 142, 112),
+    ink: Color::Rgb(255, 244, 222),
+    amber: Color::Rgb(246, 194, 68),
+    hot: Color::Rgb(255, 250, 238),
+    rock: Color::Rgb(194, 134, 82),
+    danger: Color::Rgb(228, 92, 70),
+    accent: Color::Rgb(236, 168, 88),
+    star: Color::Rgb(118, 88, 68),
+    shadow: Color::Rgb(42, 28, 20),
+    dead: Color::Rgb(46, 32, 24),
+    faint: Color::Rgb(92, 72, 56),
+};
+
 fn palette(theme: Theme) -> &'static Palette {
     match theme {
         Theme::Space => &SPACE,
         Theme::Underwater => &UNDERWATER,
         Theme::Jungle => &JUNGLE,
+        Theme::CatCafe => &CAT_CAFE,
     }
 }
 
@@ -212,10 +230,10 @@ fn draw_jungle_scenery(
     pal: &Palette,
     to_px: &impl Fn(f32, f32) -> (f32, f32),
 ) {
-    let vine_col = fade(pal.star, 0.45);
-    let leaf_col = fade(pal.star, 0.62);
-    let frond_col = fade(pal.accent, 0.34);
-    let fern_col = fade(pal.faint, 0.5);
+    let vine_col = fade(pal.shadow, 0.85);
+    let leaf_col = fade(pal.star, 0.35);
+    let frond_col = fade(pal.accent, 0.2);
+    let fern_col = fade(pal.faint, 0.35);
 
     // Palm fronds spilling in from the top corners.
     for (dir, cx) in [(1.0f32, -0.6f32), (-1.0, game.play_w + 0.6)] {
@@ -235,8 +253,8 @@ fn draw_jungle_scenery(
         }
     }
 
-    // A couple of long vines hanging from the canopy.
-    let anchors = [0.18, 0.55, 0.86];
+    // A couple of vines hanging from the canopy edges to frame the field.
+    let anchors = [0.12, 0.88];
     for (i, anchor) in anchors.iter().enumerate() {
         let seed = i as f32 * 1.7;
         let sway = (game.time * 0.28 + seed).sin();
@@ -282,7 +300,26 @@ fn draw_jungle_scenery(
     }
 }
 
-/// Falling leaves and blinking fireflies fill the jungle canopy.
+/// Motion speed for a falling jungle leaf. Slow and gentle drift.
+pub(crate) fn jungle_leaf_speed(phase: f32) -> f32 {
+    0.06 + (phase.sin() * 0.5 + 0.5) * 0.06
+}
+
+/// Motion parameters for a falling jungle leaf: (x, y, angle).
+/// Leaves only fall straight down the screen, oriented downward, moving slowly.
+pub(crate) fn jungle_leaf_motion(
+    star_x: f32,
+    star_y: f32,
+    phase: f32,
+    time: f32,
+    play_h: f32,
+) -> (f32, f32, f32) {
+    let speed = jungle_leaf_speed(phase);
+    let y = (star_y + time * speed).rem_euclid(play_h.max(1.0));
+    (star_x, y, 0.0)
+}
+
+/// Falling leaves and faint fireflies fill the jungle canopy.
 fn draw_jungle_particles(
     ink: &mut InkLayer,
     game: &Game,
@@ -292,41 +329,24 @@ fn draw_jungle_particles(
     let play_h = game.play_h.max(1.0);
     for star in &game.stars {
         if star.glyph == '✦' {
-            // Firefly: a slow bob and a soft amber pulse.
-            let y = (star.y + (game.time * 0.25 + star.phase).sin() * 0.5).rem_euclid(play_h);
-            let x = star.x + (game.time * 0.45 + star.phase * 1.7).sin() * 0.6;
-            let pulse = (game.time * 2.4 + star.phase * 2.0).sin() * 0.5 + 0.5;
-            let col = mix(pal.star, pal.amber, 0.35 + 0.5 * pulse);
+            // Firefly: a gentle bob and soft faint glow.
+            let y = (star.y + (game.time * 0.2 + star.phase).sin() * 0.3).rem_euclid(play_h);
+            let x = star.x + (game.time * 0.2 + star.phase * 1.3).sin() * 0.3;
+            let pulse = (game.time * 0.8 + star.phase).sin() * 0.5 + 0.5;
+            let col = fade(pal.star, 0.25 + 0.25 * pulse);
             let (px, py) = to_px(x, y);
             ink.dot(px, py, 0, col);
-            ink.dot(px + 1.0, py, 0, col);
-            ink.dot(px, py + 1.0, 0, col);
-            ink.dot(px + 1.0, py + 1.0, 0, col);
             continue;
         }
 
-        // Leaf: drift downward, sway, and tumble so it flashes edge-on.
-        let speed = 0.28 + (star.phase.sin() * 0.5 + 0.5) * 0.75;
-        let y = (star.y + game.time * speed).rem_euclid(play_h);
-        let sway = (game.time * (0.7 + speed * 0.4) + star.phase).sin()
-            * (0.7 + (star.phase * 1.3).sin().abs() * 0.9);
-        let x = star.x + sway;
+        // Leaf: drift gently straight down the screen at slow speed.
+        let (x, y, angle) = jungle_leaf_motion(star.x, star.y, star.phase, game.time, play_h);
         let large = star.glyph == '❧';
-        let (len, width) = if large { (2.45, 1.4) } else { (1.35, 0.8) };
-        let angle = star.phase + game.time * if large { 0.42 } else { 0.85 };
-        // The leaf appears to spin around its long axis: it narrows or widens
-        // as the face turns toward or away from the viewer.
-        let tumble = (game.time * (1.1 + speed) + star.phase * 2.3).cos().abs();
-        let width = width * (0.55 + 0.45 * tumble);
-        let roll = (star.phase * 3.7).sin() * 0.5 + 0.5;
-        let col = if roll > 0.94 {
-            mix(pal.star, pal.amber, 0.5)
-        } else if roll > 0.82 {
-            mix(pal.star, pal.accent, 0.4)
-        } else if large {
-            pal.star
+        let (len, width) = if large { (2.0, 1.0) } else { (1.2, 0.6) };
+        let col = if large {
+            fade(pal.star, 0.5)
         } else {
-            pal.faint
+            fade(pal.faint, 0.6)
         };
         ink_leaf(ink, to_px, (x, y), angle, (len, width), 0, col);
     }
@@ -373,6 +393,12 @@ pub fn draw(frame: &mut Frame, game: &Game) {
                     let speed = 0.22 + ((star.x * 0.73 + star.y * 0.19) % 1.0) * 0.58;
                     let y_world = (star.y - game.time * speed).rem_euclid(game.play_h.max(1.0));
                     let sway = (game.time * 0.6 + star.y * 1.7).sin() * 0.18;
+                    ((star.x + sway).round() as i32, y_world.round() as i32 + oy)
+                }
+                Theme::CatCafe => {
+                    let speed = 0.12 + ((star.x * 0.61 + star.y * 0.27) % 1.0) * 0.18;
+                    let y_world = (star.y - game.time * speed).rem_euclid(game.play_h.max(1.0));
+                    let sway = (game.time * 0.4 + star.y * 1.3).sin() * 0.22;
                     ((star.x + sway).round() as i32, y_world.round() as i32 + oy)
                 }
                 _ => (star.x.round() as i32, star.y.round() as i32 + oy),
@@ -452,6 +478,43 @@ pub fn draw(frame: &mut Frame, game: &Game) {
                     let (sx, sy) = to_px(hx + ux * span * stem_f, hy + uy * span * stem_f);
                     ink.dot(sx, sy, 5, pal.hot);
                 }
+                Theme::CatCafe => {
+                    let dx = x1 - x0;
+                    let dy = y1 - y0;
+                    let dist = (dx * dx + dy * dy).sqrt().max(0.001);
+                    let (ux, uy) = (dx / dist, dy / dist);
+                    let progress = 1.0 - t;
+                    let hx = x0 + dx * progress;
+                    let hy = y0 + dy * progress;
+
+                    // Perpendicular vector for claw marks spread
+                    let (px, py) = (-uy, ux);
+                    let scratch_len = 0.85;
+
+                    // Three scratch marks (claw swipes) slashing along the flight path
+                    for claw in [-1.0f32, 0.0, 1.0] {
+                        let offset = claw * 0.38;
+                        let start_x = hx + px * offset - ux * scratch_len * 0.5;
+                        let start_y = hy + py * offset - uy * scratch_len * 0.5;
+                        let end_x = hx + px * (offset + claw * 0.12) + ux * scratch_len * 0.5;
+                        let end_y = hy + py * (offset + claw * 0.12) + uy * scratch_len * 0.5;
+
+                        let (a, b) = to_px(start_x, start_y);
+                        let (c, d) = to_px(end_x, end_y);
+                        ink.line(a, b, c, d, 5, pal.amber);
+                        ink.dot(c, d, 5, pal.hot);
+                    }
+
+                    // A little flurry of trailing scratch dust
+                    let trail = dist.min(1.5);
+                    for i in 0..5 {
+                        let f = i as f32 / 4.0;
+                        let bx = hx - ux * trail * f + px * ((i as f32 * 1.7).sin() * 0.15);
+                        let by = hy - uy * trail * f + py * ((i as f32 * 1.7).sin() * 0.15);
+                        let (pax, pay) = to_px(bx, by);
+                        ink.dot(pax, pay, 3, fade(pal.accent, (1.0 - f) * (0.3 + 0.7 * t)));
+                    }
+                }
             },
             Effect::Shard { x, y, rot, len, .. } => {
                 let (x0, y0) = to_px(x - rot.cos() * len, y - rot.sin() * len);
@@ -465,6 +528,7 @@ pub fn draw(frame: &mut Frame, game: &Game) {
                     Theme::Space => (((*r * 10.0) as i32).clamp(8, 48), 1.0, 0.0),
                     Theme::Underwater => (((*r * 9.0) as i32).clamp(12, 64), 0.55, 0.05),
                     Theme::Jungle => (((*r * 10.0) as i32).clamp(10, 56), 0.82, 0.04),
+                    Theme::CatCafe => (((*r * 10.0) as i32).clamp(10, 56), 0.75, 0.03),
                 };
                 for i in 0..steps {
                     let a = i as f32 / steps as f32 * std::f32::consts::TAU;
@@ -547,6 +611,52 @@ pub fn draw(frame: &mut Frame, game: &Game) {
             }
         }
 
+        if game.theme == Theme::CatCafe {
+            // A coffee cup handle on the side.
+            let handle_angle = rock.rot + PI * 0.5;
+            let (hx, hy) = (handle_angle.cos(), handle_angle.sin());
+            let (hpx, hpy) = (-hy, hx);
+            let base_r = rock.radius * 0.85;
+            let loop_r = rock.radius * 1.35;
+            let p1 = (
+                rock.x + hx * base_r - hpx * 0.45,
+                rock.y + hy * base_r - hpy * 0.45,
+            );
+            let p2 = (rock.x + hx * loop_r, rock.y + hy * loop_r);
+            let p3 = (
+                rock.x + hx * base_r + hpx * 0.45,
+                rock.y + hy * base_r + hpy * 0.45,
+            );
+            let (a, b) = to_px(p1.0, p1.1);
+            let (c, d) = to_px(p2.0, p2.1);
+            let (e, f) = to_px(p3.0, p3.1);
+            ink.line(a, b, c, d, pri, pal.rock);
+            ink.line(c, d, e, f, pri, pal.rock);
+
+            // Rising steam curls above the coffee cup.
+            let steam_angle = rock.rot - PI * 0.5;
+            let (sx, sy) = (steam_angle.cos(), steam_angle.sin());
+            let (spx, spy) = (-sy, sx);
+            for side in [-0.28f32, 0.28] {
+                let wave = (game.time * 3.0 + rock.id as f32 + side * 4.0).sin() * 0.18;
+                let s0 = (
+                    rock.x + sx * (rock.radius * 0.8) + spx * side,
+                    rock.y + sy * (rock.radius * 0.8) + spy * side,
+                );
+                let s1 = (
+                    rock.x + sx * (rock.radius * 1.35) + spx * (side + wave),
+                    rock.y + sy * (rock.radius * 1.35) + spy * (side + wave),
+                );
+                let (sa, sb) = to_px(s0.0, s0.1);
+                let (sc, sd) = to_px(s1.0, s1.1);
+                ink.line(sa, sb, sc, sd, pri, fade(pal.faint, 0.65));
+            }
+
+            // Coffee liquid surface inside.
+            let (cx, cy) = to_px(rock.x, rock.y);
+            ink.dot(cx, cy, 3, pal.dead);
+        }
+
         if aimed {
             let steps = 20;
             let rr = rock.radius + 0.55;
@@ -564,6 +674,7 @@ pub fn draw(frame: &mut Frame, game: &Game) {
             Theme::Space => draw_space_ship(&mut ink, game, pal, to_px),
             Theme::Underwater => draw_submarine(&mut ink, game, pal, to_px),
             Theme::Jungle => draw_monkey(&mut ink, game, pal, to_px),
+            Theme::CatCafe => draw_cat(&mut ink, game, pal, to_px),
         }
     }
 
@@ -907,6 +1018,151 @@ fn draw_monkey(
     dot(ink, hand, 4, pal.ink);
 }
 
+fn draw_cat(
+    ink: &mut InkLayer,
+    game: &Game,
+    pal: &Palette,
+    to_px: impl Fn(f32, f32) -> (f32, f32),
+) {
+    let (cx, cy) = game.ship_pos();
+    let scale = 1.9;
+    let place = |p: (f32, f32)| {
+        let (x, y) = rotate(p.0 * scale, p.1 * scale, game.angle);
+        (cx + x, cy + y)
+    };
+    let seg = |ink: &mut InkLayer, a: (f32, f32), b: (f32, f32), pri: u8, col: Color| {
+        let (ax, ay) = place(a);
+        let (bx, by) = place(b);
+        let (x0, y0) = to_px(ax, ay);
+        let (x1, y1) = to_px(bx, by);
+        ink.line(x0, y0, x1, y1, pri, col);
+    };
+    let dot = |ink: &mut InkLayer, p: (f32, f32), pri: u8, col: Color| {
+        let (px, py) = place(p);
+        let (x, y) = to_px(px, py);
+        ink.dot(x, y, pri, col);
+    };
+    let ring = |ink: &mut InkLayer,
+                center: (f32, f32),
+                rx: f32,
+                ry: f32,
+                steps: usize,
+                pri: u8,
+                col: Color| {
+        let mut prev = (center.0 + rx, center.1);
+        for i in 1..=steps {
+            let a = i as f32 / steps as f32 * TAU;
+            let p = (center.0 + a.cos() * rx, center.1 + a.sin() * ry);
+            seg(ink, prev, p, pri, col);
+            prev = p;
+        }
+    };
+
+    let tilt = (-game.spin * 0.03).clamp(-0.35, 0.35);
+
+    // Fluffy tail swishing cutely behind the body.
+    let wag = (game.time * 3.2).sin() * 0.35 + game.spin * 0.05;
+    seg(ink, (0.0, 1.05), (0.2 + wag * 0.4, 1.45), 4, pal.dim);
+    seg(
+        ink,
+        (0.2 + wag * 0.4, 1.45),
+        (0.55 + wag * 0.8, 1.75),
+        4,
+        pal.dim,
+    );
+    seg(
+        ink,
+        (0.55 + wag * 0.8, 1.75),
+        (0.85 + wag * 1.2, 1.6),
+        4,
+        pal.dim,
+    );
+    dot(ink, (0.85 + wag * 1.2, 1.6), 4, pal.amber);
+
+    // Hind paws tucked under body.
+    seg(ink, (-0.45, 0.95), (-0.65, 1.25), 4, pal.ink);
+    seg(ink, (0.45, 0.95), (0.65, 1.25), 4, pal.ink);
+
+    // Body.
+    ring(ink, (0.0, 0.45), 0.62, 0.68, 12, 5, pal.ink);
+
+    // Front paws: left paw rests forward, right paw swipes out on thrust / scratch.
+    seg(ink, (-0.45, 0.1), (-0.68, -0.25), 4, pal.ink);
+    dot(ink, (-0.68, -0.25), 5, pal.ink);
+
+    let swipe = game.thrust.clamp(0.0, 1.0);
+    let paw_x = 0.68 + 0.35 * swipe;
+    let paw_y = -0.25 - 0.75 * swipe;
+    seg(ink, (0.45, 0.1), (paw_x, paw_y), 4, pal.ink);
+    dot(
+        ink,
+        (paw_x, paw_y),
+        5,
+        if swipe > 0.3 { pal.amber } else { pal.ink },
+    );
+    if swipe > 0.3 {
+        // Little claws extended from the paw!
+        seg(
+            ink,
+            (paw_x, paw_y),
+            (paw_x + 0.15, paw_y - 0.25),
+            5,
+            pal.hot,
+        );
+        seg(
+            ink,
+            (paw_x, paw_y),
+            (paw_x - 0.15, paw_y - 0.25),
+            5,
+            pal.hot,
+        );
+    }
+
+    // Head.
+    ring(ink, (0.0 + tilt, -0.55), 0.72, 0.62, 10, 5, pal.ink);
+
+    // Pointed cat ears from local geometry.
+    let ears = cat_local(game.spin);
+    for i in 0..ears.len() - 1 {
+        seg(ink, ears[i], ears[i + 1], 5, pal.ink);
+    }
+
+    // Inner ear warm shading.
+    seg(
+        ink,
+        (-0.52 + tilt, -0.95),
+        (-0.48 + tilt, -1.45),
+        4,
+        pal.amber,
+    );
+    seg(
+        ink,
+        (0.52 + tilt, -0.95),
+        (0.48 + tilt, -1.45),
+        4,
+        pal.amber,
+    );
+
+    // Golden cat eyes with soft light glint.
+    dot(ink, (-0.28 + tilt, -0.65), 5, pal.amber);
+    dot(ink, (0.28 + tilt, -0.65), 5, pal.amber);
+    dot(ink, (-0.28 + tilt, -0.72), 5, pal.hot);
+    dot(ink, (0.28 + tilt, -0.72), 5, pal.hot);
+
+    // Cute nose and mouth.
+    dot(ink, (0.0 + tilt, -0.45), 5, pal.danger);
+    seg(ink, (-0.16 + tilt, -0.35), (0.0 + tilt, -0.4), 4, pal.dim);
+    seg(ink, (0.0 + tilt, -0.4), (0.16 + tilt, -0.35), 4, pal.dim);
+
+    // Whiskers framing the face.
+    seg(ink, (-0.6 + tilt, -0.52), (-1.35 + tilt, -0.68), 3, pal.dim);
+    seg(ink, (-0.6 + tilt, -0.42), (-1.4 + tilt, -0.4), 3, pal.dim);
+    seg(ink, (-0.6 + tilt, -0.32), (-1.32 + tilt, -0.15), 3, pal.dim);
+    seg(ink, (0.6 + tilt, -0.52), (1.35 + tilt, -0.68), 3, pal.dim);
+    seg(ink, (0.6 + tilt, -0.42), (1.4 + tilt, -0.4), 3, pal.dim);
+    seg(ink, (0.6 + tilt, -0.32), (1.32 + tilt, -0.15), 3, pal.dim);
+}
+
 fn draw_label(
     buf: &mut ratatui::buffer::Buffer,
     game: &Game,
@@ -1024,6 +1280,7 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u
                     Theme::Space => "START launches. THEMES changes the look. QUIT exits.",
                     Theme::Underwater => "START dives. THEMES changes the look. QUIT exits.",
                     Theme::Jungle => "START swings. THEMES changes the look. QUIT exits.",
+                    Theme::CatCafe => "START purrs. THEMES changes the look. QUIT exits.",
                 },
                 style(pal.dim),
             );
@@ -1064,6 +1321,7 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u
                     Theme::Space => "SHIP LOST",
                     Theme::Underwater => "HULL BREACH",
                     Theme::Jungle => "MONKEY DOWN",
+                    Theme::CatCafe => "CAT NAPPING",
                 },
                 style(pal.danger).add_modifier(Modifier::BOLD),
             );
@@ -1091,6 +1349,7 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u
                     Theme::Space => "SHIP LOST",
                     Theme::Underwater => "HULL BREACH",
                     Theme::Jungle => "MONKEY DOWN",
+                    Theme::CatCafe => "CAT NAPPING",
                 },
                 style(pal.danger).add_modifier(Modifier::BOLD),
             );
@@ -1136,6 +1395,7 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u
                     Theme::Space => "no rock starts with that".to_string(),
                     Theme::Underwater => "no mine starts with that".to_string(),
                     Theme::Jungle => "no coconut starts with that".to_string(),
+                    Theme::CatCafe => "no coffee starts with that".to_string(),
                 }
             } else {
                 format!("{}{cursor}", game.buffer)
@@ -1195,6 +1455,17 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u
                         "finish the word to throw the banana".to_string()
                     }
                 }
+                Theme::CatCafe => {
+                    if game.banner_t > 0.0 && game.banner == "CAFE CLEAR" {
+                        "cafe clear — more coffee brewing".to_string()
+                    } else if word.is_empty() {
+                        "type a word to ready the cat".to_string()
+                    } else if nmatch > 1 {
+                        "nearest cup is locked — keep typing to pin it".to_string()
+                    } else {
+                        "finish the word to pounce and scratch".to_string()
+                    }
+                }
             };
             put(buf, 2, y3 as i32, &hint, style(pal.dim));
             if w >= 70 {
@@ -1211,6 +1482,9 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u
                         }
                         Theme::Jungle => {
                             "backspace erases    esc pauses    coconuts that reach the monkey cost a life"
+                        }
+                        Theme::CatCafe => {
+                            "backspace erases    esc pauses    coffee that reaches the cat costs a life"
                         }
                     },
                     style(pal.faint),
@@ -1255,6 +1529,7 @@ fn draw_title(
         Theme::Space => "typing range",
         Theme::Underwater => "~ sonar range ~",
         Theme::Jungle => "~ canopy range ~",
+        Theme::CatCafe => "~ cozy cat cafe ~",
     };
     let sx = (w as i32 - sub.len() as i32) / 2;
     let sub_y = top + art_h + 1;
@@ -1354,6 +1629,7 @@ fn draw_modal(
                 Theme::Space => "SHIP LOST",
                 Theme::Underwater => "HULL BREACH",
                 Theme::Jungle => "MONKEY DOWN",
+                Theme::CatCafe => "CAT NAPPING",
             },
             pal.danger,
         )
@@ -1640,43 +1916,32 @@ fn paint_water(buf: &mut ratatui::buffer::Buffer, area: Rect, pal: &Palette) {
     }
 }
 
-/// A shaded canopy: deep green gradient, dappled pools of light, and slow sun
-/// shafts spilling through the leaves above the play field.
-fn paint_jungle_canopy(buf: &mut ratatui::buffer::Buffer, area: Rect, pal: &Palette, time: f32) {
+/// A shaded canopy: deep green gradient with subtle, soft dappled shading
+/// and a dark vignette that stays calm and readable behind gameplay.
+fn paint_jungle_canopy(buf: &mut ratatui::buffer::Buffer, area: Rect, pal: &Palette, _time: f32) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let w = area.width as f32;
     let h = area.height.max(1) as f32;
-    let leaf_light = Color::Rgb(64, 92, 44);
-    let sun = Color::Rgb(146, 166, 92);
-    let deep = Color::Rgb(1, 7, 4);
+    let leaf_shade = fade(pal.shadow, 0.4);
+    let deep = pal.bg_bottom;
     for y in 0..area.height {
         let ty = y as f32 / h;
         let base = mix(pal.bg_top, pal.bg_bottom, ty.powf(0.82));
-        let falloff = (1.0 - ty).powf(0.7);
         let ceiling = (1.0 - ty * 5.5).max(0.0);
-        let sky = (ty * 21.0 - time * 0.15).sin();
         for x in 0..area.width {
             let fx = x as f32 / w;
 
-            // Dappled light: three interacting waves keep the patches from
-            // looking like a repeating pattern as they drift.
-            let dapple =
-                (fx * 47.0 + time * 0.24).sin() * sky * (fx * 13.0 - ty * 17.0 + 0.9).cos();
-            let v = dapple * 0.5 + 0.5;
-            let dappled = v * v * v;
-
-            // Thin diagonal shafts falling from the canopy.
-            let ray = ((fx * 5.0 - ty * 2.4) * PI + time * 0.12).sin() * 0.5 + 0.5;
-            let shaft = ray.powi(11) * falloff;
+            // Soft, static dappled pools of shade from the canopy above.
+            let dapple = (fx * 6.0).sin() * (ty * 4.0 + 0.8).cos();
+            let dappled = (dapple * 0.5 + 0.5).powi(2);
 
             // Shadowed ceiling and a soft vignette toward the sides.
             let edge = (fx - 0.5).abs() * 2.0;
             let edge = edge * edge * edge;
 
-            let mut col = mix(base, leaf_light, dappled * 0.16);
-            col = mix(col, sun, shaft * 0.14);
+            let mut col = mix(base, leaf_shade, dappled * 0.08);
             col = mix(col, deep, (ceiling * 0.7 + edge * 0.3).min(1.0));
             buf[(area.x + x, area.y + y)].set_bg(col);
         }
@@ -1797,5 +2062,105 @@ mod tests {
         let screen = render(&game, 80, 24);
         assert!(screen.contains("SELECT THEME"), "{screen}");
         assert!(screen.contains("UNDERWATER"), "{screen}");
+        assert!(screen.contains("CAT CAFE"), "{screen}");
+    }
+
+    #[test]
+    fn cat_cafe_theme_renders_its_cat_and_hazards() {
+        use crate::game::Rock;
+        let mut game = Game::new(80, 24, 42);
+        game.open_themes();
+        game.theme_choice = Theme::CatCafe.index();
+        game.apply_theme();
+        game.start();
+        game.rocks.clear();
+        game.effects.clear();
+        game.banner.clear();
+        game.banner_t = 0.0;
+        game.phase = Phase::Playing;
+        let shape = (0..12)
+            .map(|i| {
+                let a = i as f32 / 12.0 * std::f32::consts::TAU;
+                (a.cos() * 2.0, a.sin() * 2.0)
+            })
+            .collect();
+        game.rocks.push(Rock {
+            id: 99,
+            x: 70.0,
+            y: 8.0,
+            vx: 0.0,
+            vy: 0.0,
+            radius: 2.0,
+            rot: 0.2,
+            spin: 0.0,
+            shape,
+            word: "coffee".into(),
+            live: true,
+            hit: 0.0,
+        });
+        game.type_char('c');
+        for _ in 0..6 {
+            game.update(1.0 / 60.0);
+        }
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("coffee"), "{screen}");
+        assert!(screen.contains("pounce and scratch"), "{screen}");
+    }
+
+    #[test]
+    fn jungle_leaves_only_fall_down_and_move_slowly() {
+        let star_x = 40.0;
+        let star_y = 5.0;
+        let play_h = 24.0;
+
+        for phase in [0.0, 1.0, 2.5, 4.0, 5.5] {
+            let speed = jungle_leaf_speed(phase);
+            assert!(
+                speed <= 0.15,
+                "speed {speed} should be much slower (<= 0.15)"
+            );
+            assert!(speed > 0.0, "speed {speed} must be positive");
+
+            let (x0, y0, a0) = jungle_leaf_motion(star_x, star_y, phase, 0.0, play_h);
+            let (x1, y1, a1) = jungle_leaf_motion(star_x, star_y, phase, 1.0, play_h);
+            let (x2, y2, a2) = jungle_leaf_motion(star_x, star_y, phase, 5.0, play_h);
+
+            // X must never sway or deviate horizontally: leaves only fall down the screen.
+            assert_eq!(x0, star_x);
+            assert_eq!(x1, star_x);
+            assert_eq!(x2, star_x);
+
+            // Angle must point straight down.
+            assert_eq!(a0, 0.0);
+            assert_eq!(a1, 0.0);
+            assert_eq!(a2, 0.0);
+
+            // Y must progress downwards.
+            assert!(y1 > y0, "leaf should fall downward: y0={y0}, y1={y1}");
+            assert!(y2 > y1, "leaf should fall downward: y1={y1}, y2={y2}");
+        }
+    }
+
+    #[test]
+    fn jungle_canopy_background_is_stable_over_time() {
+        let area = Rect::new(0, 0, 80, 24);
+        let pal = palette(Theme::Jungle);
+
+        let mut buf0 = ratatui::buffer::Buffer::empty(area);
+        paint_jungle_canopy(&mut buf0, area, pal, 0.0);
+
+        let mut buf1 = ratatui::buffer::Buffer::empty(area);
+        paint_jungle_canopy(&mut buf1, area, pal, 10.0);
+
+        // Background colors should remain calm and stable across frames.
+        for y in 0..area.height {
+            for x in 0..area.width {
+                assert_eq!(
+                    buf0[(x, y)].bg,
+                    buf1[(x, y)].bg,
+                    "background at ({x}, {y}) should not flicker over time"
+                );
+            }
+        }
     }
 }

@@ -28,16 +28,23 @@ pub enum Theme {
     Space,
     Underwater,
     Jungle,
+    CatCafe,
 }
 
 impl Theme {
-    pub const ALL: [Theme; 3] = [Theme::Space, Theme::Underwater, Theme::Jungle];
+    pub const ALL: [Theme; 4] = [
+        Theme::Space,
+        Theme::Underwater,
+        Theme::Jungle,
+        Theme::CatCafe,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Theme::Space => "SPACE",
             Theme::Underwater => "UNDERWATER",
             Theme::Jungle => "JUNGLE",
+            Theme::CatCafe => "CAT CAFE",
         }
     }
 
@@ -46,6 +53,7 @@ impl Theme {
             Theme::Space => 0,
             Theme::Underwater => 1,
             Theme::Jungle => 2,
+            Theme::CatCafe => 3,
         }
     }
 
@@ -266,6 +274,18 @@ pub fn spaceship_local(spin: f32) -> [(f32, f32); 4] {
         (1.2 + bank, 1.2),
         (bank * 0.4, 0.55),
         (-1.2 + bank, 1.2),
+    ]
+}
+
+pub fn cat_local(spin: f32) -> [(f32, f32); 6] {
+    let tilt = (-spin * 0.03).clamp(-0.35, 0.35);
+    [
+        (-0.68 + tilt, -0.85), // Left ear outer base
+        (-0.62 + tilt, -1.65), // Left ear tip
+        (-0.18 + tilt, -1.15), // Forehead left
+        (0.18 + tilt, -1.15),  // Forehead right
+        (0.62 + tilt, -1.65),  // Right ear tip
+        (0.68 + tilt, -0.85),  // Right ear outer base
     ]
 }
 
@@ -614,6 +634,7 @@ impl Game {
                 Theme::Space => "WAVE CLEAR".to_string(),
                 Theme::Underwater => "MINEFIELD CLEAR".to_string(),
                 Theme::Jungle => "CANOPY CLEAR".to_string(),
+                Theme::CatCafe => "CAFE CLEAR".to_string(),
             };
             self.banner_t = 1.45;
             self.buffer.clear();
@@ -780,6 +801,8 @@ impl Game {
                 (Theme::Underwater, false) => '·',
                 (Theme::Jungle, true) => '✦',
                 (Theme::Jungle, false) => '·',
+                (Theme::CatCafe, true) => '✧',
+                (Theme::CatCafe, false) => '·',
             },
         });
         if let Some(rock) = self.rocks.iter_mut().find(|r| r.id == id) {
@@ -990,6 +1013,61 @@ impl Game {
                     });
                 }
             }
+            Theme::CatCafe => {
+                // A cup of coffee bursts: expanding warm ripples, coffee drops, ceramic shards.
+                for i in 0..2 {
+                    let life = 0.36 + i as f32 * 0.12;
+                    self.effects.push(Effect::Ring {
+                        x,
+                        y,
+                        r: radius * (0.32 + i as f32 * 0.28),
+                        vr: 14.0 + i as f32 * 3.5,
+                        life,
+                        max: life,
+                    });
+                }
+                let glyphs = ['~', '·', '°', 'o', '✧', '*'];
+                for i in 0..20 {
+                    let a = (i as f32 / 20.0) * TAU + self.rng.range(-0.2, 0.2);
+                    let sp = self.rng.range(5.0, 14.0);
+                    self.effects.push(Effect::Spark {
+                        x: x + a.cos() * radius * 0.3,
+                        y: y + a.sin() * radius * 0.3,
+                        vx: a.cos() * sp,
+                        vy: a.sin() * sp - self.rng.range(0.5, 2.5),
+                        life: self.rng.range(0.3, 0.7),
+                        max: 0.7,
+                        glyph: glyphs[(self.rng.next() as usize) % glyphs.len()],
+                    });
+                }
+                for (i, ch) in word.chars().enumerate() {
+                    let a = (i as f32 / word.len().max(1) as f32) * TAU;
+                    let sp = self.rng.range(4.0, 11.0);
+                    self.effects.push(Effect::Spark {
+                        x,
+                        y,
+                        vx: a.cos() * sp,
+                        vy: a.sin() * sp - 2.2,
+                        life: 0.75,
+                        max: 0.75,
+                        glyph: ch,
+                    });
+                }
+                for i in 0..8 {
+                    let a = (i as f32 / 8.0) * TAU;
+                    self.effects.push(Effect::Shard {
+                        x,
+                        y,
+                        vx: a.cos() * self.rng.range(4.0, 11.0),
+                        vy: a.sin() * self.rng.range(4.0, 11.0),
+                        rot: a,
+                        spin: self.rng.range(-7.0, 7.0),
+                        len: self.rng.range(0.5, 1.4),
+                        life: self.rng.range(0.3, 0.65),
+                        max: 0.65,
+                    });
+                }
+            }
         }
         while self.effects.len() > 240 {
             self.effects.remove(0);
@@ -1028,6 +1106,7 @@ impl Game {
                 Theme::Space => "SHIP LOST".to_string(),
                 Theme::Underwater => "HULL BREACH".to_string(),
                 Theme::Jungle => "MONKEY DOWN".to_string(),
+                Theme::CatCafe => "CAT NAPPING".to_string(),
             };
             self.banner_t = 0.95;
         }
@@ -1035,7 +1114,7 @@ impl Game {
 
     fn spawn_threat(&mut self) {
         let word = self.pick_word();
-        let radius = 1.7 + (word.len() as f32 * 0.18).min(1.6);
+        let radius = 1.8 + (word.len() as f32 * 0.15).min(1.2);
         let (x, y) = self.edge_point();
         let (cx, cy) = self.ship_center();
         let tx = cx + self.rng.range(-7.0, 7.0);
@@ -1050,7 +1129,7 @@ impl Game {
 
     fn spawn_drifter(&mut self) {
         let word = self.rng.pick(words::SHORT).to_string();
-        let radius = 1.8 + self.rng.range(0.0, 1.2);
+        let radius = 1.8 + (word.len() as f32 * 0.15);
         let x = self.rng.range(2.0, self.play_w - 2.0);
         let y = self.rng.range(2.0, (self.play_h - 2.0).max(3.0));
         let mut rock = self.make_rock(x, y, radius, word);
@@ -1073,22 +1152,22 @@ impl Game {
     }
 
     fn make_rock(&mut self, x: f32, y: f32, radius: f32, word: String) -> Rock {
-        let coconut = self.theme == Theme::Jungle;
-        let n = if coconut {
+        let round = self.theme == Theme::Jungle || self.theme == Theme::CatCafe;
+        let n = if round {
             12
         } else {
             8 + (self.rng.next() as usize % 4)
         };
         let mut shape = Vec::with_capacity(n);
         for i in 0..n {
-            let jitter = if coconut {
+            let jitter = if round {
                 self.rng.range(-0.06, 0.06)
             } else {
                 self.rng.range(-0.22, 0.22)
             };
             let a = (i as f32 + jitter) / n as f32 * TAU;
             let r = radius
-                * if coconut {
+                * if round {
                     self.rng.range(0.94, 1.04)
                 } else {
                     self.rng.range(0.72, 1.12)
@@ -1187,6 +1266,7 @@ impl Game {
             Theme::Space => 0.028,
             Theme::Underwater => 0.032,
             Theme::Jungle => 0.05,
+            Theme::CatCafe => 0.045,
         };
         while self.exhaust > period {
             self.exhaust -= period;
@@ -1224,6 +1304,17 @@ impl Game {
                         life: self.rng.range(0.22, 0.46),
                         max: 0.46,
                         glyph: if self.rng.f32() < 0.7 { '·' } else { '✦' },
+                    });
+                }
+                Theme::CatCafe => {
+                    self.effects.push(Effect::Spark {
+                        x: sx - fx * 1.1 + px,
+                        y: sy - fy * 1.1 + py,
+                        vx: -fx * self.rng.range(3.0, 7.0) + self.rng.range(-1.2, 1.2),
+                        vy: -fy * self.rng.range(3.0, 7.0) + self.rng.range(-1.2, 1.2) - 0.6,
+                        life: self.rng.range(0.2, 0.42),
+                        max: 0.42,
+                        glyph: if self.rng.f32() < 0.6 { '·' } else { '✧' },
                     });
                 }
             }
@@ -1302,16 +1393,16 @@ impl Game {
 
     fn reseed_stars(&mut self) {
         self.stars.clear();
-        let density = if self.theme == Theme::Jungle {
-            170.0
-        } else {
-            22.0
+        let density = match self.theme {
+            Theme::Jungle => 170.0,
+            Theme::CatCafe => 110.0,
+            _ => 22.0,
         };
         let count = ((self.play_w * self.play_h) / density) as usize;
-        let cap = if self.theme == Theme::Jungle {
-            50
-        } else {
-            360
+        let cap = match self.theme {
+            Theme::Jungle => 50,
+            Theme::CatCafe => 60,
+            _ => 360,
         };
         for _ in 0..count.min(cap) {
             let glyph = match self.theme {
@@ -1340,6 +1431,16 @@ impl Game {
                         '❧'
                     } else {
                         ','
+                    }
+                }
+                Theme::CatCafe => {
+                    let roll = self.rng.f32();
+                    if roll < 0.35 {
+                        '~'
+                    } else if roll < 0.70 {
+                        '·'
+                    } else {
+                        '✧'
                     }
                 }
             };
@@ -1504,6 +1605,15 @@ mod tests {
 
         g.open_themes();
         assert_eq!(g.theme_choice, Theme::Jungle.index());
+        g.theme_move(1);
+        assert_eq!(g.theme_choice, Theme::CatCafe.index());
+        g.apply_theme();
+        assert_eq!(g.theme, Theme::CatCafe);
+        assert!(!g.theme_menu_open);
+        assert!(g.stars.iter().any(|s| matches!(s.glyph, '~' | '·' | '✧')));
+
+        g.open_themes();
+        assert_eq!(g.theme_choice, Theme::CatCafe.index());
         g.theme_move(1);
         assert_eq!(g.theme_choice, Theme::Space.index());
         g.apply_theme();
