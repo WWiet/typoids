@@ -97,13 +97,44 @@ are siblings and may use `crate::game::...`, `crate::draw::...`, etc.
 - Backgrounds:
   - Space and Underwater use `paint_water` (vertical gradient).
   - Jungle uses `paint_jungle_canopy` (gradient plus dappled light), then
-    `draw_jungle_scenery` (fronds, vines, undergrowth) and
+    `draw_jungle_scenery` (corner fronds only) and
     `draw_jungle_particles` (falling leaves and fireflies).
 - `Star.glyph` doubles as a particle species marker. For Jungle: `'✦'` is a
   firefly, `'❧'` a large leaf, `','` a small leaf; `Star.phase` makes motion
   deterministic. Other themes use stars/bubbles in plain cells.
 - Keep Jungle background density low (`reseed_stars` uses a larger divisor for
   Jungle). It is scenery, not the main event.
+
+### Visual design rules
+
+The look is "quiet field, loud words": a calm retro braille field where only
+the things the player acts on carry color. Hold to this when adding visuals.
+
+- **Layout.** The header is one row (row 0): wave, score, hearts, combo, and a
+  right-aligned best score. The dock is two rows: an input line (`›`, typed
+  text, then the rest of the locked word ghosted) and one hint line. `metrics()`
+  owns this (`origin_y = 1`, `dock_h = 2`). No rule lines or boxes; spacing and
+  color separate things. Do not add HUD rows without a strong reason.
+- **Words are chips.** `draw_label` paints every word on a `pal.chip`
+  background with one padding cell on each side. The locked word gets a warmer
+  chip and `‹ ›` brackets instead of padding. Do not draw bare words over the
+  braille layer.
+- **One shape per job, themes only recolor.** Projectiles go through
+  `draw_projectile` (dash plus three-dot tail) and `projectile_colors`.
+  Explosions are `Game::burst` (one ring, six shards). Exhaust is one dim `·`.
+  Do not reintroduce per-theme spark confetti, letter bursts, lock rings, or
+  blinking fuses; if a theme needs character, put it in the ship, the hazard
+  silhouette, the palette, or the ring's squash/wobble.
+- **Hazards are an outline plus at most one signature mark** (mines: six short
+  horns, coconuts: three pores, cups: a handle, with steam only while locked).
+  The lock state is shown by color and the chip, not extra geometry.
+- **Backgrounds stay dim.** Particle density is low (`reseed_stars`), scenery
+  sits at braille priority 0 in the faintest palette tones, and the Jungle
+  canopy keeps only the top-corner fronds. If you can only see the background
+  and not the hazards, it is too loud.
+- **Unicode.** Stick to single-width glyphs (`·`, `›`, `‹`, `♥`, `♡`, `█`). Use
+  `chars().count()` for text width, never `len()`, whenever a string may hold
+  non-ASCII. `write()` already does.
 
 ### Adding or changing a theme
 
@@ -113,10 +144,14 @@ are siblings and may use `crate::game::...`, `crate::draw::...`, etc.
    (title subtitle, game-over text, prompts).
 4. Pick the ship renderer in the `match game.theme` block in `draw()`. Local
    ship geometry belongs in `game.rs` as a `*_local()` function.
-5. Give hazards a theme-specific silhouette in the rock loop if needed.
-6. Give projectiles a theme-specific `Effect::Laser` branch.
-7. Seed background particles in `reseed_stars`.
-8. Update the theme-selection test in `game.rs` and the render test in `draw.rs`.
+5. Give hazards a theme-specific silhouette in the rock loop if needed. Keep it
+   to an outline plus one signature mark.
+6. Pick head and tail colors in `projectile_colors`. Do not write a new
+   projectile; add a `Palette::chip` color for word chips.
+7. Seed a few dim background particles in `reseed_stars`, and add the theme's
+   exhaust distance and speed in `spawn_exhaust`'s tuple.
+8. Update the theme-selection test in `game.rs`. `every_theme_has_one_line_hud_and_word_chips`
+   in `draw.rs` loops over `Theme::ALL` and covers HUD and chips automatically.
 9. Update `README.md`.
 
 ## Style
@@ -129,6 +164,31 @@ are siblings and may use `crate::game::...`, `crate::draw::...`, etc.
 - Avoid new dependencies unless they are clearly necessary. ratatui already
   covers terminal I/O and layout.
 
+### Writing code in this codebase
+
+- **Prefer data over branching.** If a `match game.theme` arm repeats the same
+  body with different numbers or colors, collapse it to one body that takes a
+  tuple or a small helper (see `burst`, `projectile_colors`, the exhaust
+  tuple). A fourth theme should be a new row of data, not a new copy of code.
+  Do not copy-paste a block per theme.
+- **Extract before a function grows.** `draw()` is already long. New drawing
+  goes in its own helper that takes `ink`, `to_px`, and the palette, like
+  `draw_projectile`. Return `String`/`&'static str` from small copy helpers
+  (`play_hint`, `game_over_label`) instead of inlining strings in three places.
+- **Single source for repeated copy.** Game-over labels, hints, and menu text
+  live in one helper each. If you need the same text in two screens, call the
+  helper.
+- **Delete, don't comment out.** Remove dead code and unused parameters when a
+  change makes them dead (clippy `-D warnings` will tell you).
+- **Make edits precisely.** Do not use blanket `sed` or regex deletes across
+  `game.rs`/`draw.rs`; identical lines recur in several functions (for example
+  `let word = rock.word.clone();`). Edit with exact context and rebuild.
+- **Keep game logic out of `draw.rs`.** Rendering reads `Game`; it never
+  mutates it or rolls RNG.
+- **Look at it.** Tests only prove strings render. After a visual change, run
+  `cargo run --release` in a terminal of at least 80x24 (and a small one) and
+  check each theme you touched.
+
 ## Tests
 
 Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
@@ -136,11 +196,13 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
 - Game tests use `Game::new(w, h, seed)` (seeded) and helpers such as
   `playing()`. Do not depend on timing or filesystem state except through
   `Game::new`'s best-score load.
+- Build scenario games with helpers such as `locked_rock_game(theme, word)`
+  rather than copying rock setup into each test.
 - Draw tests render with `ratatui::backend::TestBackend` via the `render()`
   helper and assert on the resulting text (e.g. menu labels and hint copy).
   Add a render assertion when you add player-visible strings or theme visuals.
 - Every behavior change should add or update a focused test. Keep the suite
-  green; currently 21 tests.
+  green; currently 22 tests.
 
 ## Gotchas
 

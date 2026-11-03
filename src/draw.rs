@@ -25,6 +25,8 @@ struct Palette {
     shadow: Color,
     dead: Color,
     faint: Color,
+    /// Backing tone behind word chips.
+    chip: Color,
 }
 
 const SPACE: Palette = Palette {
@@ -41,6 +43,7 @@ const SPACE: Palette = Palette {
     shadow: Color::Rgb(40, 64, 50),
     dead: Color::Rgb(40, 52, 44),
     faint: Color::Rgb(62, 84, 72),
+    chip: Color::Rgb(14, 22, 20),
 };
 
 const UNDERWATER: Palette = Palette {
@@ -57,6 +60,7 @@ const UNDERWATER: Palette = Palette {
     shadow: Color::Rgb(20, 78, 98),
     dead: Color::Rgb(24, 48, 60),
     faint: Color::Rgb(52, 104, 122),
+    chip: Color::Rgb(6, 26, 38),
 };
 
 const JUNGLE: Palette = Palette {
@@ -73,6 +77,7 @@ const JUNGLE: Palette = Palette {
     shadow: Color::Rgb(26, 64, 36),
     dead: Color::Rgb(42, 34, 24),
     faint: Color::Rgb(72, 112, 70),
+    chip: Color::Rgb(12, 30, 18),
 };
 
 const CAT_CAFE: Palette = Palette {
@@ -89,6 +94,7 @@ const CAT_CAFE: Palette = Palette {
     shadow: Color::Rgb(42, 28, 20),
     dead: Color::Rgb(46, 32, 24),
     faint: Color::Rgb(92, 72, 56),
+    chip: Color::Rgb(40, 28, 20),
 };
 
 fn palette(theme: Theme) -> &'static Palette {
@@ -221,8 +227,7 @@ fn ink_leaf(
     ink.line(a.0, a.1, b.0, b.1, pri, col);
 }
 
-/// Hanging vines, and palm fronds drooping in from the canopy edges, frame the
-/// play field. Everything here sits at the lowest braille priority so hazards
+/// Palm fronds drooping in from the top corners frame the play field. Everything here sits at the lowest braille priority so hazards
 /// and the monkey always stay on top.
 fn draw_jungle_scenery(
     ink: &mut InkLayer,
@@ -231,9 +236,7 @@ fn draw_jungle_scenery(
     to_px: &impl Fn(f32, f32) -> (f32, f32),
 ) {
     let vine_col = fade(pal.shadow, 0.85);
-    let leaf_col = fade(pal.star, 0.35);
     let frond_col = fade(pal.accent, 0.2);
-    let fern_col = fade(pal.faint, 0.35);
 
     // Palm fronds spilling in from the top corners.
     for (dir, cx) in [(1.0f32, -0.6f32), (-1.0, game.play_w + 0.6)] {
@@ -250,52 +253,6 @@ fn draw_jungle_scenery(
             let (s, c) = angle.sin_cos();
             let head = (x - s * len * 0.42, y + c * len * 0.42);
             ink_leaf(ink, to_px, head, angle, (len, 1.25), 0, frond_col);
-        }
-    }
-
-    // A couple of vines hanging from the canopy edges to frame the field.
-    let anchors = [0.12, 0.88];
-    for (i, anchor) in anchors.iter().enumerate() {
-        let seed = i as f32 * 1.7;
-        let sway = (game.time * 0.28 + seed).sin();
-        let x0 = game.play_w * anchor + sway * 0.3;
-        let len = 3.0 + (seed * 1.3).sin().abs() * 2.4;
-        let steps = 8;
-        let mut prev = (x0, -0.5);
-        for step in 1..=steps {
-            let u = step as f32 / steps as f32;
-            let x = x0 + (u * 3.4 + game.time * 0.35 + seed).sin() * 0.24;
-            let y = -0.5 + len * u;
-            let a = to_px(prev.0, prev.1);
-            let b = to_px(x, y);
-            ink.line(a.0, a.1, b.0, b.1, 0, vine_col);
-            prev = (x, y);
-        }
-        for k in 1..=2 {
-            let u = k as f32 / 2.0;
-            let x = x0 + (u * 3.4 + game.time * 0.35 + seed).sin() * 0.24;
-            let y = -0.5 + len * u;
-            let side = if k % 2 == 0 { 1.0 } else { -1.0 };
-            let flop = (game.time * 0.4 + seed + k as f32).sin() * 0.15;
-            let angle = side * (1.0 + flop);
-            let (s, c) = angle.sin_cos();
-            let len_leaf = 1.0 - u * 0.2;
-            let head = (x - s * len_leaf * 0.4, y + c * len_leaf * 0.4);
-            ink_leaf(ink, to_px, head, angle, (len_leaf, 0.45), 0, leaf_col);
-        }
-    }
-
-    // A little undergrowth creeping up the bottom corners.
-    for (dir, cx) in [(-1.0f32, 0.2f32), (1.0, game.play_w - 0.2)] {
-        for k in 0..2 {
-            let t = k as f32 / 1.0;
-            let angle = dir * (0.2 + t * 0.5) + (game.time * 0.25 + t).sin() * 0.06;
-            let len = 1.5 - t * 0.4;
-            let base_x = cx + dir * t * 0.9;
-            let base_y = game.play_h + 0.4;
-            let (s, c) = angle.sin_cos();
-            let head = (base_x - s * len * 0.5, base_y - c * len * 0.5);
-            ink_leaf(ink, to_px, head, angle + PI, (len, 0.35), 0, fern_col);
         }
     }
 }
@@ -350,6 +307,44 @@ fn draw_jungle_particles(
         };
         ink_leaf(ink, to_px, (x, y), angle, (len, width), 0, col);
     }
+}
+
+fn projectile_colors(theme: Theme, pal: &Palette) -> (Color, Color) {
+    match theme {
+        Theme::Space | Theme::Underwater => (pal.hot, pal.accent),
+        Theme::Jungle | Theme::CatCafe => (pal.amber, pal.amber),
+    }
+}
+
+/// Every theme fires the same shape: a short bright dash with a three-dot
+/// fading tail. Themes differ only in color.
+fn draw_projectile(
+    ink: &mut InkLayer,
+    to_px: &impl Fn(f32, f32) -> (f32, f32),
+    path: (f32, f32, f32, f32),
+    life: f32,
+    head: Color,
+    tail: Color,
+) {
+    let (x0, y0, x1, y1) = path;
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let dist = (dx * dx + dy * dy).sqrt().max(0.001);
+    let (ux, uy) = (dx / dist, dy / dist);
+    let progress = 1.0 - life;
+    let (hx, hy) = (x0 + dx * progress, y0 + dy * progress);
+    for i in 1..=3 {
+        let back = 0.6 + i as f32 * 0.45;
+        let (px, py) = to_px(hx - ux * back, hy - uy * back);
+        ink.dot(
+            px,
+            py,
+            4,
+            fade(tail, (1.0 - i as f32 / 4.0) * (0.3 + 0.7 * life)),
+        );
+    }
+    let (a, b) = to_px(hx - ux * 0.6, hy - uy * 0.6);
+    let (c, d) = to_px(hx, hy);
+    ink.line(a, b, c, d, 5, head);
 }
 
 pub fn draw(frame: &mut Frame, game: &Game) {
@@ -410,112 +405,10 @@ pub fn draw(frame: &mut Frame, game: &Game) {
     for effect in &game.effects {
         let t = effect.life_ratio();
         match effect {
-            Effect::Laser { x0, y0, x1, y1, .. } => match game.theme {
-                Theme::Space => {
-                    let (a, b) = to_px(*x0, *y0);
-                    let (c, d) = to_px(*x1, *y1);
-                    ink.line(a, b, c, d, 4, fade(pal.hot, 0.25 + 0.75 * t));
-                }
-                Theme::Underwater => {
-                    let dx = x1 - x0;
-                    let dy = y1 - y0;
-                    let dist = (dx * dx + dy * dy).sqrt().max(0.001);
-                    let (ux, uy) = (dx / dist, dy / dist);
-                    let progress = 1.0 - t;
-                    let hx = x0 + dx * progress;
-                    let hy = y0 + dy * progress;
-                    let trail = dist.min(2.4);
-                    for i in 0..7 {
-                        let f = i as f32 / 6.0;
-                        let wob = (i as f32 * 1.9 + game.time * 24.0).sin() * 0.09;
-                        let bx = hx - ux * trail * f - uy * wob;
-                        let by = hy - uy * trail * f + ux * wob;
-                        let (px, py) = to_px(bx, by);
-                        ink.dot(px, py, 3, fade(pal.accent, (1.0 - f) * (0.25 + 0.75 * t)));
-                    }
-                    let (a, b) = to_px(hx - ux * 0.5, hy - uy * 0.5);
-                    let (c, d) = to_px(hx, hy);
-                    ink.line(a, b, c, d, 5, pal.hot);
-                    ink.dot(c, d, 5, pal.hot);
-                }
-                Theme::Jungle => {
-                    let dx = x1 - x0;
-                    let dy = y1 - y0;
-                    let dist = (dx * dx + dy * dy).sqrt().max(0.001);
-                    let (ux, uy) = (dx / dist, dy / dist);
-                    let progress = 1.0 - t;
-                    let hx = x0 + dx * progress;
-                    let hy = y0 + dy * progress;
-
-                    // A bright trail behind the thrown banana.
-                    let trail = dist.min(1.9);
-                    for i in 0..7 {
-                        let f = i as f32 / 6.0;
-                        let wob = (i as f32 * 2.1 + game.time * 20.0).sin() * 0.08;
-                        let bx = hx - ux * trail * f - uy * wob;
-                        let by = hy - uy * trail * f + ux * wob;
-                        let (px, py) = to_px(bx, by);
-                        ink.dot(px, py, 3, fade(pal.amber, (1.0 - f) * (0.18 + 0.82 * t)));
-                    }
-
-                    // The banana itself: a short curved crescent along the flight.
-                    let (bx, by) = (-uy, ux);
-                    let span = 0.9;
-                    let bow = 0.24;
-                    let mut prev: Option<(f32, f32)> = None;
-                    for i in 0..=5 {
-                        let f = i as f32 / 5.0 - 0.5;
-                        let bend = (1.0 - (2.0 * f).abs()) * bow;
-                        let px = hx + ux * span * f + bx * bend;
-                        let py = hy + uy * span * f + by * bend;
-                        let p = to_px(px, py);
-                        if let Some(q) = prev {
-                            ink.line(q.0, q.1, p.0, p.1, 5, pal.amber);
-                        }
-                        prev = Some(p);
-                    }
-                    let stem_f = -0.5;
-                    let (sx, sy) = to_px(hx + ux * span * stem_f, hy + uy * span * stem_f);
-                    ink.dot(sx, sy, 5, pal.hot);
-                }
-                Theme::CatCafe => {
-                    let dx = x1 - x0;
-                    let dy = y1 - y0;
-                    let dist = (dx * dx + dy * dy).sqrt().max(0.001);
-                    let (ux, uy) = (dx / dist, dy / dist);
-                    let progress = 1.0 - t;
-                    let hx = x0 + dx * progress;
-                    let hy = y0 + dy * progress;
-
-                    // Perpendicular vector for claw marks spread
-                    let (px, py) = (-uy, ux);
-                    let scratch_len = 0.85;
-
-                    // Three scratch marks (claw swipes) slashing along the flight path
-                    for claw in [-1.0f32, 0.0, 1.0] {
-                        let offset = claw * 0.38;
-                        let start_x = hx + px * offset - ux * scratch_len * 0.5;
-                        let start_y = hy + py * offset - uy * scratch_len * 0.5;
-                        let end_x = hx + px * (offset + claw * 0.12) + ux * scratch_len * 0.5;
-                        let end_y = hy + py * (offset + claw * 0.12) + uy * scratch_len * 0.5;
-
-                        let (a, b) = to_px(start_x, start_y);
-                        let (c, d) = to_px(end_x, end_y);
-                        ink.line(a, b, c, d, 5, pal.amber);
-                        ink.dot(c, d, 5, pal.hot);
-                    }
-
-                    // A little flurry of trailing scratch dust
-                    let trail = dist.min(1.5);
-                    for i in 0..5 {
-                        let f = i as f32 / 4.0;
-                        let bx = hx - ux * trail * f + px * ((i as f32 * 1.7).sin() * 0.15);
-                        let by = hy - uy * trail * f + py * ((i as f32 * 1.7).sin() * 0.15);
-                        let (pax, pay) = to_px(bx, by);
-                        ink.dot(pax, pay, 3, fade(pal.accent, (1.0 - f) * (0.3 + 0.7 * t)));
-                    }
-                }
-            },
+            Effect::Laser { x0, y0, x1, y1, .. } => {
+                let (head, tail) = projectile_colors(game.theme, pal);
+                draw_projectile(&mut ink, &to_px, (*x0, *y0, *x1, *y1), t, head, tail);
+            }
             Effect::Shard { x, y, rot, len, .. } => {
                 let (x0, y0) = to_px(x - rot.cos() * len, y - rot.sin() * len);
                 let (x1, y1) = to_px(x + rot.cos() * len, y + rot.sin() * len);
@@ -555,16 +448,18 @@ pub fn draw(frame: &mut Frame, game: &Game) {
         let pri = if aimed { 2 } else { 1 };
 
         if game.theme == Theme::Underwater {
-            // Mine horns.
-            let spikes = 10;
-            for i in 0..spikes {
-                let a = rock.rot + i as f32 / spikes as f32 * std::f32::consts::TAU;
-                let inner = rock.radius * 0.92;
-                let outer = rock.radius * (1.26 + (i % 2) as f32 * 0.13);
-                let (x0, y0) = to_px(rock.x + a.cos() * inner, rock.y + a.sin() * inner);
-                let (x1, y1) = to_px(rock.x + a.cos() * outer, rock.y + a.sin() * outer);
+            // Six short horns.
+            for i in 0..6 {
+                let a = rock.rot + i as f32 / 6.0 * std::f32::consts::TAU;
+                let (x0, y0) = to_px(
+                    rock.x + a.cos() * rock.radius * 0.95,
+                    rock.y + a.sin() * rock.radius * 0.95,
+                );
+                let (x1, y1) = to_px(
+                    rock.x + a.cos() * rock.radius * 1.25,
+                    rock.y + a.sin() * rock.radius * 1.25,
+                );
                 ink.line(x0, y0, x1, y1, pri, col);
-                ink.dot(x1, y1, pri, col);
             }
         }
 
@@ -580,29 +475,8 @@ pub fn draw(frame: &mut Frame, game: &Game) {
             ink.line(x0, y0, x1, y1, pri, col);
         }
 
-        if game.theme == Theme::Underwater {
-            // A blinking contact fuse in the middle.
-            let pulse = (game.time * 4.0 + rock.id as f32).sin();
-            let core = if aimed || rock.hit > 0.0 {
-                pal.hot
-            } else if pulse > 0.55 {
-                pal.danger
-            } else {
-                pal.dim
-            };
-            let (cx, cy) = to_px(rock.x, rock.y);
-            ink.dot(cx, cy, 3, core);
-        }
-
         if game.theme == Theme::Jungle {
-            // Coconut stem, plus the three germination pores ("eyes").
-            let (ax, ay) = rotate(0.0, -rock.radius * 0.96, rock.rot);
-            let (bx, by) = rotate(0.0, -rock.radius * 1.16, rock.rot);
-            let (x0, y0) = to_px(rock.x + ax, rock.y + ay);
-            let (x1, y1) = to_px(rock.x + bx, rock.y + by);
-            ink.line(x0, y0, x1, y1, pri, pal.faint);
-            ink.dot(x1, y1, pri, pal.faint);
-
+            // Three germination pores.
             let pores = [(-0.28, -0.16), (0.28, -0.16), (0.0, 0.24)];
             for (ox, oy) in pores {
                 let (px, py) = rotate(ox, oy, rock.rot);
@@ -637,7 +511,7 @@ pub fn draw(frame: &mut Frame, game: &Game) {
             let steam_angle = rock.rot - PI * 0.5;
             let (sx, sy) = (steam_angle.cos(), steam_angle.sin());
             let (spx, spy) = (-sy, sx);
-            for side in [-0.28f32, 0.28] {
+            for side in [-0.28f32, 0.28].into_iter().filter(|_| aimed) {
                 let wave = (game.time * 3.0 + rock.id as f32 + side * 4.0).sin() * 0.18;
                 let s0 = (
                     rock.x + sx * (rock.radius * 0.8) + spx * side,
@@ -650,20 +524,6 @@ pub fn draw(frame: &mut Frame, game: &Game) {
                 let (sa, sb) = to_px(s0.0, s0.1);
                 let (sc, sd) = to_px(s1.0, s1.1);
                 ink.line(sa, sb, sc, sd, pri, fade(pal.faint, 0.65));
-            }
-
-            // Coffee liquid surface inside.
-            let (cx, cy) = to_px(rock.x, rock.y);
-            ink.dot(cx, cy, 3, pal.dead);
-        }
-
-        if aimed {
-            let steps = 20;
-            let rr = rock.radius + 0.55;
-            for i in 0..steps {
-                let a = i as f32 / steps as f32 * std::f32::consts::TAU + game.time * 0.8;
-                let (px, py) = to_px(rock.x + a.cos() * rr, rock.y + a.sin() * rr * 0.55);
-                ink.dot(px, py, 2, pal.amber);
             }
         }
     }
@@ -772,7 +632,7 @@ pub fn draw(frame: &mut Frame, game: &Game) {
     }
 
     if game.hurt > 0.0 {
-        hline(buf, 0, w, 1, pal.danger);
+        hline(buf, 0, w, m.origin_y, pal.danger);
         hline(buf, 0, w, m.dock_y.saturating_sub(1), pal.danger);
     }
 
@@ -1173,9 +1033,10 @@ fn draw_label(
     origin_y: i32,
 ) {
     let (x, y) = pos;
-    let len = word.len() as i32;
-    let max_left = (game.play_w as i32 - len).max(0);
-    let left = (x.round() as i32 - len / 2).clamp(0, max_left);
+    // One padding cell each side; the chip is word + 2 wide.
+    let width = word.len() as i32 + 2;
+    let max_left = (game.play_w as i32 - width).max(0);
+    let left = (x.round() as i32 - width / 2).clamp(0, max_left);
     let mut row = (y + radius + 0.85).round() as i32;
     if row >= game.play_h as i32 - 1 {
         row = (y - radius - 1.2).round() as i32;
@@ -1186,55 +1047,60 @@ fn draw_label(
         0
     };
     let locked = game.target_word() == Some(word);
+    let bg = if locked {
+        mix(pal.chip, pal.amber, 0.16)
+    } else {
+        pal.chip
+    };
+    let row = row + origin_y;
+    let pad = if locked {
+        style(pal.amber).bg(bg).add_modifier(Modifier::BOLD)
+    } else {
+        style(pal.dim).bg(bg)
+    };
+    put(buf, left, row, if locked { "‹" } else { " " }, pad);
     for (i, ch) in word.chars().enumerate() {
-        let style = if i < matched {
+        let st = if i < matched {
             style(pal.amber).add_modifier(Modifier::BOLD)
         } else if locked {
             style(pal.ink)
         } else {
             style(pal.dim)
         };
-        put(buf, left + i as i32, row + origin_y, &ch.to_string(), style);
+        put(buf, left + 1 + i as i32, row, &ch.to_string(), st.bg(bg));
     }
+    put(
+        buf,
+        left + width - 1,
+        row,
+        if locked { "›" } else { " " },
+        pad,
+    );
 }
 
 fn draw_header(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u16) {
-    hline(buf, 0, w, 1, pal.dim);
-    let mut x = 1u16;
-    x = write(
+    let mut x = write(
         buf,
-        x,
+        1,
         0,
-        "TYPOIDS",
-        style(pal.ink).add_modifier(Modifier::BOLD),
-    );
-    x = write(
-        buf,
-        x,
-        0,
-        &format!("  WAVE {:02}", game.wave.max(1)),
+        &format!("WAVE {:02}", game.wave.max(1)),
         style(pal.dim),
     );
     x = write(
         buf,
         x,
         0,
-        &format!("  SCORE {:06}", game.score),
-        style(pal.amber),
+        &format!("   {:06}", game.score),
+        style(pal.amber).add_modifier(Modifier::BOLD),
     );
-    if w >= 72 {
-        x = write(
-            buf,
-            x,
-            0,
-            &format!("  BEST {:06}", game.best),
-            style(pal.dim),
-        );
-    }
-    x = write(buf, x, 0, "  HULL ", style(pal.dim));
+    x = write(buf, x, 0, "   ", style(pal.dim));
     for i in 0..3 {
-        let col = if i < game.lives { pal.ink } else { pal.dead };
-        x = write(buf, x, 0, "#", style(col));
+        let (glyph, col) = if i < game.lives {
+            ("♥", pal.danger)
+        } else {
+            ("♡", pal.dead)
+        };
+        x = write(buf, x, 0, glyph, style(col));
         if i != 2 {
             x = write(buf, x, 0, " ", style(pal.dim));
         }
@@ -1244,254 +1110,191 @@ fn draw_header(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w:
             buf,
             x,
             0,
-            &format!("  x{}", game.combo),
+            &format!("   x{}", game.combo),
             style(pal.amber).add_modifier(Modifier::BOLD),
         );
     }
+    if w >= 72 {
+        let best = format!("BEST {:06}", game.best);
+        let bx = w.saturating_sub(best.chars().count() as u16 + 1);
+        let _ = write(buf, bx, 0, &best, style(pal.faint));
+    }
 }
 
+fn game_over_label(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Space => "SHIP LOST",
+        Theme::Underwater => "HULL BREACH",
+        Theme::Jungle => "MONKEY DOWN",
+        Theme::CatCafe => "CAT NAPPING",
+    }
+}
+
+fn play_hint(game: &Game, word: &str, nmatch: usize) -> String {
+    match game.theme {
+        Theme::Space => {
+            if game.banner_t > 0.0 && game.banner == "WAVE CLEAR" {
+                "wave clear — next rocks inbound".to_string()
+            } else if word.is_empty() {
+                "type a word to aim the ship".to_string()
+            } else if nmatch > 1 {
+                "nearest rock is locked — keep typing to pin it".to_string()
+            } else {
+                "finish the word to detonate".to_string()
+            }
+        }
+        Theme::Underwater => {
+            if game.banner_t > 0.0 && game.banner == "MINEFIELD CLEAR" {
+                "minefield clear — next mines inbound".to_string()
+            } else if word.is_empty() {
+                "type a word to arm the torpedo".to_string()
+            } else if nmatch > 1 {
+                "nearest mine is locked — keep typing to pin it".to_string()
+            } else {
+                "finish the word to detonate".to_string()
+            }
+        }
+        Theme::Jungle => {
+            if game.banner_t > 0.0 && game.banner == "CANOPY CLEAR" {
+                "canopy clear — more coconuts inbound".to_string()
+            } else if word.is_empty() {
+                "type a word to aim the monkey".to_string()
+            } else if nmatch > 1 {
+                "nearest coconut is locked — keep typing to pin it".to_string()
+            } else {
+                "finish the word to throw the banana".to_string()
+            }
+        }
+        Theme::CatCafe => {
+            if game.banner_t > 0.0 && game.banner == "CAFE CLEAR" {
+                "cafe clear — more coffee brewing".to_string()
+            } else if word.is_empty() {
+                "type a word to ready the cat".to_string()
+            } else if nmatch > 1 {
+                "nearest cup is locked — keep typing to pin it".to_string()
+            } else {
+                "finish the word to pounce and scratch".to_string()
+            }
+        }
+    }
+}
+
+/// Two rows: an input line and one line of context. No rules or boxes.
 fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u16, dock_y: u16) {
-    hline(
-        buf,
-        0,
-        w,
-        dock_y,
-        if game.miss > 0.0 { pal.danger } else { pal.dim },
-    );
-    let y1 = dock_y + 1;
-    let y2 = dock_y + 2;
-    let y3 = dock_y + 3;
-    let y4 = dock_y + 4;
+    let y1 = dock_y as i32;
+    let y2 = dock_y as i32 + 1;
+    let bold = Modifier::BOLD;
 
     match game.phase {
         Phase::Title => {
             put(
                 buf,
                 2,
-                y1 as i32,
-                "h j k l / arrows  move      enter  select",
-                style(pal.ink),
-            );
-            put(
-                buf,
-                2,
-                y2 as i32,
-                match game.theme {
-                    Theme::Space => "START launches. THEMES changes the look. QUIT exits.",
-                    Theme::Underwater => "START dives. THEMES changes the look. QUIT exits.",
-                    Theme::Jungle => "START swings. THEMES changes the look. QUIT exits.",
-                    Theme::CatCafe => "START purrs. THEMES changes the look. QUIT exits.",
-                },
+                y1,
+                "h j k l / arrows move  ·  enter select  ·  q quits",
                 style(pal.dim),
             );
-            put(
-                buf,
-                2,
-                y3 as i32,
-                if game.theme_menu_open {
-                    "ENTER applies the theme. ESC goes back."
-                } else {
-                    "Q also quits"
-                },
-                style(pal.amber),
-            );
+            let line = if game.theme_menu_open {
+                "ENTER applies the theme. ESC goes back."
+            } else {
+                match game.theme {
+                    Theme::Space => "START launches. THEMES changes the look.",
+                    Theme::Underwater => "START dives. THEMES changes the look.",
+                    Theme::Jungle => "START swings. THEMES changes the look.",
+                    Theme::CatCafe => "START purrs. THEMES changes the look.",
+                }
+            };
+            put(buf, 2, y2, line, style(pal.amber));
         }
         Phase::Paused => {
-            put(
+            let x = write(
                 buf,
                 2,
-                y1 as i32,
+                dock_y,
                 "PAUSED",
-                style(pal.amber).add_modifier(Modifier::BOLD),
+                style(pal.amber).add_modifier(bold),
             );
             put(
                 buf,
-                2,
-                y2 as i32,
-                "ESC resumes     Q returns to title",
+                x as i32 + 2,
+                y1,
+                "esc resumes  ·  q returns to title",
                 style(pal.dim),
             );
         }
         Phase::GameOver => {
-            put(
+            let x = write(
                 buf,
                 2,
-                y1 as i32,
-                match game.theme {
-                    Theme::Space => "SHIP LOST",
-                    Theme::Underwater => "HULL BREACH",
-                    Theme::Jungle => "MONKEY DOWN",
-                    Theme::CatCafe => "CAT NAPPING",
-                },
-                style(pal.danger).add_modifier(Modifier::BOLD),
+                dock_y,
+                game_over_label(game.theme),
+                style(pal.danger).add_modifier(bold),
             );
             put(
                 buf,
-                2,
-                y2 as i32,
-                &format!("SCORE {:06}    BEST {:06}", game.score, game.best),
+                x as i32 + 2,
+                y1,
+                &format!("SCORE {:06}   BEST {:06}", game.score, game.best),
                 style(pal.ink),
             );
-            put(
-                buf,
-                2,
-                y3 as i32,
-                "ENTER selects     Q quits",
-                style(pal.amber),
-            );
+            put(buf, 2, y2, "enter selects  ·  q quits", style(pal.dim));
         }
         Phase::Dying => {
             put(
                 buf,
                 2,
-                y1 as i32,
-                match game.theme {
-                    Theme::Space => "SHIP LOST",
-                    Theme::Underwater => "HULL BREACH",
-                    Theme::Jungle => "MONKEY DOWN",
-                    Theme::CatCafe => "CAT NAPPING",
-                },
-                style(pal.danger).add_modifier(Modifier::BOLD),
+                y1,
+                game_over_label(game.theme),
+                style(pal.danger).add_modifier(bold),
             );
         }
         Phase::Playing => {
             let word = game.target_word().unwrap_or("");
             let nmatch = game.matches();
-            if word.is_empty() {
-                put(buf, 2, y1 as i32, "NO LOCK", style(pal.dim));
+            let missed = game.miss > 0.0;
+            let accent = if missed { pal.danger } else { pal.amber };
+            put(buf, 2, y1, "›", style(accent).add_modifier(bold));
+
+            if game.miss > 0.08 && game.buffer.is_empty() {
+                let msg = match game.theme {
+                    Theme::Space => "no rock starts with that",
+                    Theme::Underwater => "no mine starts with that",
+                    Theme::Jungle => "no coconut starts with that",
+                    Theme::CatCafe => "no coffee starts with that",
+                };
+                put(buf, 4, y1, msg, style(pal.danger).add_modifier(bold));
             } else {
-                put(buf, 2, y1 as i32, "LOCK", style(pal.dim));
-                let mut x = 8i32;
-                for (i, ch) in word.chars().enumerate() {
-                    let on = i < game.buffer.len();
-                    let st = if on {
-                        style(Color::Rgb(20, 16, 8))
-                            .bg(pal.amber)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        style(pal.ink)
-                    };
-                    put(buf, x, y1 as i32, &ch.to_ascii_uppercase().to_string(), st);
-                    x += 2;
-                }
+                let typed_col = if missed { pal.danger } else { pal.hot };
+                let mut x = write(
+                    buf,
+                    4,
+                    dock_y,
+                    &game.buffer,
+                    style(typed_col).add_modifier(bold),
+                );
+                let cursor = if ((game.time * 3.0) as i32).rem_euclid(2) == 0 {
+                    "█"
+                } else {
+                    " "
+                };
+                x = write(buf, x, dock_y, cursor, style(accent));
+                // The rest of the locked word, ghosted after the cursor.
+                let rest = word.get(game.buffer.len()..).unwrap_or("");
+                x = write(buf, x, dock_y, rest, style(pal.faint));
                 if nmatch > 1 {
                     put(
                         buf,
-                        x + 2,
-                        y1 as i32,
-                        &format!("{nmatch} MATCH"),
+                        x as i32 + 2,
+                        y1,
+                        &format!("{nmatch} match"),
                         style(pal.dim),
                     );
                 }
             }
-
-            let cursor = if ((game.time * 3.0) as i32).rem_euclid(2) == 0 {
-                "█"
-            } else {
-                " "
-            };
-            let typed = if game.miss > 0.08 && game.buffer.is_empty() {
-                match game.theme {
-                    Theme::Space => "no rock starts with that".to_string(),
-                    Theme::Underwater => "no mine starts with that".to_string(),
-                    Theme::Jungle => "no coconut starts with that".to_string(),
-                    Theme::CatCafe => "no coffee starts with that".to_string(),
-                }
-            } else {
-                format!("{}{cursor}", game.buffer)
-            };
-            let col = if game.miss > 0.0 {
-                pal.danger
-            } else {
-                pal.amber
-            };
-            put(
-                buf,
-                2,
-                y2 as i32,
-                ">",
-                style(col).add_modifier(Modifier::BOLD),
-            );
-            put(
-                buf,
-                4,
-                y2 as i32,
-                &typed,
-                style(if game.miss > 0.0 { pal.danger } else { pal.hot })
-                    .add_modifier(Modifier::BOLD),
-            );
-
-            let hint = match game.theme {
-                Theme::Space => {
-                    if game.banner_t > 0.0 && game.banner == "WAVE CLEAR" {
-                        "wave clear — next rocks inbound".to_string()
-                    } else if word.is_empty() {
-                        "type a word to aim the ship".to_string()
-                    } else if nmatch > 1 {
-                        "nearest rock is locked — keep typing to pin it".to_string()
-                    } else {
-                        "finish the word to detonate".to_string()
-                    }
-                }
-                Theme::Underwater => {
-                    if game.banner_t > 0.0 && game.banner == "MINEFIELD CLEAR" {
-                        "minefield clear — next mines inbound".to_string()
-                    } else if word.is_empty() {
-                        "type a word to arm the torpedo".to_string()
-                    } else if nmatch > 1 {
-                        "nearest mine is locked — keep typing to pin it".to_string()
-                    } else {
-                        "finish the word to detonate".to_string()
-                    }
-                }
-                Theme::Jungle => {
-                    if game.banner_t > 0.0 && game.banner == "CANOPY CLEAR" {
-                        "canopy clear — more coconuts inbound".to_string()
-                    } else if word.is_empty() {
-                        "type a word to aim the monkey".to_string()
-                    } else if nmatch > 1 {
-                        "nearest coconut is locked — keep typing to pin it".to_string()
-                    } else {
-                        "finish the word to throw the banana".to_string()
-                    }
-                }
-                Theme::CatCafe => {
-                    if game.banner_t > 0.0 && game.banner == "CAFE CLEAR" {
-                        "cafe clear — more coffee brewing".to_string()
-                    } else if word.is_empty() {
-                        "type a word to ready the cat".to_string()
-                    } else if nmatch > 1 {
-                        "nearest cup is locked — keep typing to pin it".to_string()
-                    } else {
-                        "finish the word to pounce and scratch".to_string()
-                    }
-                }
-            };
-            put(buf, 2, y3 as i32, &hint, style(pal.dim));
-            if w >= 70 {
-                put(
-                    buf,
-                    2,
-                    y4 as i32,
-                    match game.theme {
-                        Theme::Space => {
-                            "backspace erases    esc pauses    rocks that reach the hull cost a life"
-                        }
-                        Theme::Underwater => {
-                            "backspace erases    esc pauses    mines that reach the sub cost a life"
-                        }
-                        Theme::Jungle => {
-                            "backspace erases    esc pauses    coconuts that reach the monkey cost a life"
-                        }
-                        Theme::CatCafe => {
-                            "backspace erases    esc pauses    coffee that reaches the cat costs a life"
-                        }
-                    },
-                    style(pal.faint),
-                );
-            }
+            put(buf, 2, y2, &play_hint(game, word, nmatch), style(pal.dim));
         }
     }
+    let _ = w;
 }
 
 fn draw_title(
@@ -1874,7 +1677,7 @@ fn hline(buf: &mut ratatui::buffer::Buffer, x0: u16, x1: u16, y: u16, col: Color
 
 fn write(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, text: &str, style: Style) -> u16 {
     put(buf, x as i32, y as i32, text, style);
-    x.saturating_add(text.len() as u16)
+    x.saturating_add(text.chars().count() as u16)
 }
 
 fn put(buf: &mut ratatui::buffer::Buffer, x: i32, y: i32, text: &str, style: Style) {
@@ -2045,6 +1848,64 @@ mod tests {
         let screen = render(&game, 80, 24);
         assert!(screen.contains("coconut"), "{screen}");
         assert!(screen.contains("throw the banana"), "{screen}");
+    }
+
+    /// A started run in `theme` with one locked rock carrying `word`.
+    fn locked_rock_game(theme: Theme, word: &str) -> Game {
+        use crate::game::Rock;
+        let mut game = Game::new(80, 24, 42);
+        game.open_themes();
+        game.theme_choice = theme.index();
+        game.apply_theme();
+        game.start();
+        game.rocks.clear();
+        game.effects.clear();
+        game.banner.clear();
+        game.banner_t = 0.0;
+        game.phase = Phase::Playing;
+        let shape = (0..12)
+            .map(|i| {
+                let a = i as f32 / 12.0 * std::f32::consts::TAU;
+                (a.cos() * 2.0, a.sin() * 2.0)
+            })
+            .collect();
+        game.rocks.push(Rock {
+            id: 99,
+            x: 60.0,
+            y: 8.0,
+            vx: 0.0,
+            vy: 0.0,
+            radius: 2.0,
+            rot: 0.2,
+            spin: 0.0,
+            shape,
+            word: word.into(),
+            live: true,
+            hit: 0.0,
+        });
+        game.type_char(word.chars().next().unwrap());
+        for _ in 0..6 {
+            game.update(1.0 / 60.0);
+        }
+        game
+    }
+
+    #[test]
+    fn every_theme_has_one_line_hud_and_word_chips() {
+        for theme in Theme::ALL {
+            let game = locked_rock_game(theme, "comet");
+            let screen = render(&game, 80, 24);
+            let rows: Vec<&str> = screen.lines().collect();
+            assert!(rows[0].contains("WAVE 01"), "{screen}");
+            assert!(rows[0].contains("♥"), "{screen}");
+            assert!(rows[0].contains("BEST"), "{screen}");
+            assert!(!screen.contains("HULL"), "{screen}");
+            assert!(screen.contains("‹comet›"), "locked chip\n{screen}");
+            // Input line carries the typed letter and the ghosted remainder.
+            assert!(rows[22].contains("›"), "{screen}");
+            assert!(rows[22].contains("omet"), "{screen}");
+            assert!(rows[23].contains("finish the word"), "{screen}");
+        }
     }
 
     #[test]

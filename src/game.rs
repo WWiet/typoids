@@ -298,8 +298,8 @@ pub struct Metrics {
 }
 
 pub fn metrics(term_w: u16, term_h: u16) -> Metrics {
-    let dock_h = 5;
-    let origin_y = 2;
+    let dock_h = 2;
+    let origin_y = 1;
     let play_h = term_h.saturating_sub(origin_y + dock_h);
     Metrics {
         play_w: term_w,
@@ -844,233 +844,36 @@ impl Game {
                 format!("+{pts}")
             },
         });
-        self.burst(x, y, radius, word);
+        self.burst(x, y, radius);
         self.rocks.retain(|r| r.id != id);
         self.buffer.clear();
         self.target = None;
     }
 
-    fn burst(&mut self, x: f32, y: f32, radius: f32, word: &str) {
-        match self.theme {
-            Theme::Space => {
-                self.effects.push(Effect::Ring {
-                    x,
-                    y,
-                    r: radius * 0.4,
-                    vr: 18.0,
-                    life: 0.42,
-                    max: 0.42,
-                });
-                let glyphs = ['*', '+', '#', '%', 'x', '·'];
-                for i in 0..18 {
-                    let a = (i as f32 / 18.0) * TAU + self.rng.range(-0.2, 0.2);
-                    let sp = self.rng.range(6.0, 16.0);
-                    self.effects.push(Effect::Spark {
-                        x: x + a.cos() * radius * 0.3,
-                        y: y + a.sin() * radius * 0.3,
-                        vx: a.cos() * sp,
-                        vy: a.sin() * sp,
-                        life: self.rng.range(0.28, 0.62),
-                        max: 0.62,
-                        glyph: glyphs[(self.rng.next() as usize) % glyphs.len()],
-                    });
-                }
-                for (i, ch) in word.chars().enumerate() {
-                    let a = (i as f32 / word.len().max(1) as f32) * TAU;
-                    let sp = self.rng.range(5.0, 12.0);
-                    self.effects.push(Effect::Spark {
-                        x,
-                        y,
-                        vx: a.cos() * sp,
-                        vy: a.sin() * sp - 2.0,
-                        life: 0.7,
-                        max: 0.7,
-                        glyph: ch,
-                    });
-                }
-                for i in 0..8 {
-                    let a = (i as f32 / 8.0) * TAU;
-                    self.effects.push(Effect::Shard {
-                        x,
-                        y,
-                        vx: a.cos() * self.rng.range(4.0, 11.0),
-                        vy: a.sin() * self.rng.range(4.0, 11.0),
-                        rot: a,
-                        spin: self.rng.range(-6.0, 6.0),
-                        len: self.rng.range(0.6, 1.5),
-                        life: self.rng.range(0.35, 0.6),
-                        max: 0.6,
-                    });
-                }
-            }
-            Theme::Underwater => {
-                // A mine cook-off sends out several concentric surface waves.
-                for i in 0..3 {
-                    let life = 0.46 + i as f32 * 0.11;
-                    self.effects.push(Effect::Ring {
-                        x,
-                        y,
-                        r: radius * (0.24 + i as f32 * 0.27),
-                        vr: 13.0 + i as f32 * 3.5,
-                        life,
-                        max: life,
-                    });
-                }
-                let glyphs = ['°', '·', 'o', '○', '◦', '˙'];
-                for i in 0..22 {
-                    let a = (i as f32 / 22.0) * TAU + self.rng.range(-0.2, 0.2);
-                    let sp = self.rng.range(5.0, 15.0);
-                    self.effects.push(Effect::Spark {
-                        x: x + a.cos() * radius * 0.3,
-                        y: y + a.sin() * radius * 0.3,
-                        vx: a.cos() * sp,
-                        vy: a.sin() * sp - self.rng.range(0.0, 2.5),
-                        life: self.rng.range(0.35, 0.8),
-                        max: 0.8,
-                        glyph: glyphs[(self.rng.next() as usize) % glyphs.len()],
-                    });
-                }
-                for (i, ch) in word.chars().enumerate() {
-                    let a = (i as f32 / word.len().max(1) as f32) * TAU;
-                    let sp = self.rng.range(4.0, 11.0);
-                    self.effects.push(Effect::Spark {
-                        x,
-                        y,
-                        vx: a.cos() * sp,
-                        vy: a.sin() * sp - 2.2,
-                        life: 0.75,
-                        max: 0.75,
-                        glyph: ch,
-                    });
-                }
-                for i in 0..10 {
-                    let a = (i as f32 / 10.0) * TAU;
-                    self.effects.push(Effect::Shard {
-                        x,
-                        y,
-                        vx: a.cos() * self.rng.range(4.0, 12.0),
-                        vy: a.sin() * self.rng.range(4.0, 12.0),
-                        rot: a,
-                        spin: self.rng.range(-7.0, 7.0),
-                        len: self.rng.range(0.45, 1.35),
-                        life: self.rng.range(0.3, 0.7),
-                        max: 0.7,
-                    });
-                }
-            }
-            Theme::Jungle => {
-                // A coconut cracking open scatters husk and leaves.
-                for i in 0..2 {
-                    let life = 0.34 + i as f32 * 0.12;
-                    self.effects.push(Effect::Ring {
-                        x,
-                        y,
-                        r: radius * (0.3 + i as f32 * 0.3),
-                        vr: 12.0 + i as f32 * 4.0,
-                        life,
-                        max: life,
-                    });
-                }
-                let glyphs = ['✦', '·', 'o', '(', ')', '*'];
-                for i in 0..20 {
-                    let a = (i as f32 / 20.0) * TAU + self.rng.range(-0.25, 0.25);
-                    let sp = self.rng.range(5.0, 14.0);
-                    self.effects.push(Effect::Spark {
-                        x: x + a.cos() * radius * 0.28,
-                        y: y + a.sin() * radius * 0.28,
-                        vx: a.cos() * sp,
-                        vy: a.sin() * sp - self.rng.range(0.5, 3.0),
-                        life: self.rng.range(0.32, 0.72),
-                        max: 0.72,
-                        glyph: glyphs[(self.rng.next() as usize) % glyphs.len()],
-                    });
-                }
-                for (i, ch) in word.chars().enumerate() {
-                    let a = (i as f32 / word.len().max(1) as f32) * TAU;
-                    let sp = self.rng.range(4.0, 11.0);
-                    self.effects.push(Effect::Spark {
-                        x,
-                        y,
-                        vx: a.cos() * sp,
-                        vy: a.sin() * sp - 2.4,
-                        life: 0.75,
-                        max: 0.75,
-                        glyph: ch,
-                    });
-                }
-                for i in 0..9 {
-                    let a = (i as f32 / 9.0) * TAU;
-                    self.effects.push(Effect::Shard {
-                        x,
-                        y,
-                        vx: a.cos() * self.rng.range(4.0, 11.0),
-                        vy: a.sin() * self.rng.range(4.0, 11.0),
-                        rot: a,
-                        spin: self.rng.range(-8.0, 8.0),
-                        len: self.rng.range(0.5, 1.4),
-                        life: self.rng.range(0.3, 0.65),
-                        max: 0.65,
-                    });
-                }
-            }
-            Theme::CatCafe => {
-                // A cup of coffee bursts: expanding warm ripples, coffee drops, ceramic shards.
-                for i in 0..2 {
-                    let life = 0.36 + i as f32 * 0.12;
-                    self.effects.push(Effect::Ring {
-                        x,
-                        y,
-                        r: radius * (0.32 + i as f32 * 0.28),
-                        vr: 14.0 + i as f32 * 3.5,
-                        life,
-                        max: life,
-                    });
-                }
-                let glyphs = ['~', '·', '°', 'o', '✧', '*'];
-                for i in 0..20 {
-                    let a = (i as f32 / 20.0) * TAU + self.rng.range(-0.2, 0.2);
-                    let sp = self.rng.range(5.0, 14.0);
-                    self.effects.push(Effect::Spark {
-                        x: x + a.cos() * radius * 0.3,
-                        y: y + a.sin() * radius * 0.3,
-                        vx: a.cos() * sp,
-                        vy: a.sin() * sp - self.rng.range(0.5, 2.5),
-                        life: self.rng.range(0.3, 0.7),
-                        max: 0.7,
-                        glyph: glyphs[(self.rng.next() as usize) % glyphs.len()],
-                    });
-                }
-                for (i, ch) in word.chars().enumerate() {
-                    let a = (i as f32 / word.len().max(1) as f32) * TAU;
-                    let sp = self.rng.range(4.0, 11.0);
-                    self.effects.push(Effect::Spark {
-                        x,
-                        y,
-                        vx: a.cos() * sp,
-                        vy: a.sin() * sp - 2.2,
-                        life: 0.75,
-                        max: 0.75,
-                        glyph: ch,
-                    });
-                }
-                for i in 0..8 {
-                    let a = (i as f32 / 8.0) * TAU;
-                    self.effects.push(Effect::Shard {
-                        x,
-                        y,
-                        vx: a.cos() * self.rng.range(4.0, 11.0),
-                        vy: a.sin() * self.rng.range(4.0, 11.0),
-                        rot: a,
-                        spin: self.rng.range(-7.0, 7.0),
-                        len: self.rng.range(0.5, 1.4),
-                        life: self.rng.range(0.3, 0.65),
-                        max: 0.65,
-                    });
-                }
-            }
-        }
-        while self.effects.len() > 240 {
-            self.effects.remove(0);
+    /// One explosion shape for every theme: a ring and a few shards. Themes
+    /// differ only in how `draw` colors and squashes the ring.
+    fn burst(&mut self, x: f32, y: f32, radius: f32) {
+        self.effects.push(Effect::Ring {
+            x,
+            y,
+            r: radius * 0.4,
+            vr: 18.0,
+            life: 0.42,
+            max: 0.42,
+        });
+        for i in 0..6 {
+            let a = (i as f32 / 6.0) * TAU;
+            self.effects.push(Effect::Shard {
+                x,
+                y,
+                vx: a.cos() * self.rng.range(4.0, 11.0),
+                vy: a.sin() * self.rng.range(4.0, 11.0),
+                rot: a,
+                spin: self.rng.range(-6.0, 6.0),
+                len: self.rng.range(0.6, 1.5),
+                life: self.rng.range(0.35, 0.6),
+                max: 0.6,
+            });
         }
     }
 
@@ -1085,7 +888,6 @@ impl Game {
             return;
         };
         let (x, y, radius) = (rock.x, rock.y, rock.radius);
-        let word = rock.word.clone();
         self.lives = self.lives.saturating_sub(1);
         self.invuln = 1.45;
         self.hurt = 0.5;
@@ -1097,7 +899,7 @@ impl Game {
         let kx = self.rng.range(-1.0, 1.0);
         let ky = self.rng.range(-1.0, 1.0);
         self.kick(kx, ky, 10.0);
-        self.burst(x, y, radius, &word);
+        self.burst(x, y, radius);
         self.rocks.retain(|r| r.id != id);
         if self.lives == 0 {
             self.phase = Phase::Dying;
@@ -1262,62 +1064,27 @@ impl Game {
         self.exhaust += dt;
         let (sx, sy) = self.ship_pos();
         let (fx, fy) = forward(self.angle);
-        let period = match self.theme {
-            Theme::Space => 0.028,
-            Theme::Underwater => 0.032,
-            Theme::Jungle => 0.05,
-            Theme::CatCafe => 0.045,
+        // Sparse exhaust: one dim dot every so often, drifting back from the hull.
+        let period = 0.06;
+        let (back, speed) = match self.theme {
+            Theme::Space => (1.15, 9.0),
+            Theme::Underwater => (1.72, 7.5),
+            Theme::Jungle => (1.05, 4.0),
+            Theme::CatCafe => (1.1, 5.0),
         };
         while self.exhaust > period {
             self.exhaust -= period;
             let spread = self.rng.range(-0.45, 0.45);
             let (px, py) = rotate(spread, 0.0, self.angle);
-            match self.theme {
-                Theme::Space => {
-                    self.effects.push(Effect::Spark {
-                        x: sx - fx * 1.15 + px,
-                        y: sy - fy * 1.15 + py,
-                        vx: -fx * self.rng.range(6.0, 12.0) + self.rng.range(-1.5, 1.5),
-                        vy: -fy * self.rng.range(6.0, 12.0) + self.rng.range(-1.5, 1.5),
-                        life: self.rng.range(0.12, 0.28),
-                        max: 0.28,
-                        glyph: if self.rng.f32() < 0.7 { '*' } else { '+' },
-                    });
-                }
-                Theme::Underwater => {
-                    self.effects.push(Effect::Spark {
-                        x: sx - fx * 1.72 + px,
-                        y: sy - fy * 1.72 + py,
-                        vx: -fx * self.rng.range(5.0, 10.0) + self.rng.range(-1.4, 1.4),
-                        vy: -fy * self.rng.range(5.0, 10.0) + self.rng.range(-1.4, 1.4) - 1.2,
-                        life: self.rng.range(0.18, 0.38),
-                        max: 0.38,
-                        glyph: if self.rng.f32() < 0.72 { '°' } else { '·' },
-                    });
-                }
-                Theme::Jungle => {
-                    self.effects.push(Effect::Spark {
-                        x: sx - fx * 1.05 + px,
-                        y: sy - fy * 1.05 + py,
-                        vx: -fx * self.rng.range(2.5, 6.0) + self.rng.range(-1.2, 1.2),
-                        vy: -fy * self.rng.range(2.5, 6.0) + self.rng.range(-1.2, 1.2) - 0.8,
-                        life: self.rng.range(0.22, 0.46),
-                        max: 0.46,
-                        glyph: if self.rng.f32() < 0.7 { '·' } else { '✦' },
-                    });
-                }
-                Theme::CatCafe => {
-                    self.effects.push(Effect::Spark {
-                        x: sx - fx * 1.1 + px,
-                        y: sy - fy * 1.1 + py,
-                        vx: -fx * self.rng.range(3.0, 7.0) + self.rng.range(-1.2, 1.2),
-                        vy: -fy * self.rng.range(3.0, 7.0) + self.rng.range(-1.2, 1.2) - 0.6,
-                        life: self.rng.range(0.2, 0.42),
-                        max: 0.42,
-                        glyph: if self.rng.f32() < 0.6 { '·' } else { '✧' },
-                    });
-                }
-            }
+            self.effects.push(Effect::Spark {
+                x: sx - fx * back + px,
+                y: sy - fy * back + py,
+                vx: -fx * speed * self.rng.range(0.6, 1.2) + self.rng.range(-1.2, 1.2),
+                vy: -fy * speed * self.rng.range(0.6, 1.2) + self.rng.range(-1.2, 1.2),
+                life: self.rng.range(0.15, 0.35),
+                max: 0.35,
+                glyph: '·',
+            });
         }
     }
 
@@ -1394,21 +1161,21 @@ impl Game {
     fn reseed_stars(&mut self) {
         self.stars.clear();
         let density = match self.theme {
-            Theme::Jungle => 170.0,
-            Theme::CatCafe => 110.0,
-            _ => 22.0,
+            Theme::Jungle => 260.0,
+            Theme::CatCafe => 200.0,
+            _ => 70.0,
         };
         let count = ((self.play_w * self.play_h) / density) as usize;
         let cap = match self.theme {
-            Theme::Jungle => 50,
-            Theme::CatCafe => 60,
-            _ => 360,
+            Theme::Jungle => 30,
+            Theme::CatCafe => 30,
+            _ => 80,
         };
         for _ in 0..count.min(cap) {
             let glyph = match self.theme {
                 Theme::Space => {
-                    if self.rng.f32() < 0.82 {
-                        '.'
+                    if self.rng.f32() < 0.93 {
+                        '·'
                     } else {
                         '+'
                     }
