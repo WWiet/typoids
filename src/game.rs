@@ -1,7 +1,7 @@
 //! Simulation for TYPOIDS. The terminal shell only feeds keys and paints this.
 
 use crate::save::{self, RunSave};
-use crate::upgrades::{Upgrade, Upgrades};
+use crate::upgrades::{Rarity, Upgrade, Upgrades};
 use crate::words;
 use std::f32::consts::{PI, TAU};
 use std::fs;
@@ -34,11 +34,9 @@ pub const OVER_AGAIN: usize = 0;
 pub const OVER_THEMES: usize = 1;
 pub const OVER_QUIT: usize = 2;
 
-/// Offers per shop, plus a reroll button and a "next wave" button.
+/// Offers per shop (a fourth with Wide Shop), plus a reroll button and a
+/// "next wave" button after the cards.
 pub const SHOP_SLOTS: usize = 3;
-pub const SHOP_REROLL: usize = SHOP_SLOTS;
-pub const SHOP_GO: usize = SHOP_SLOTS + 1;
-const SHOP_ENTRIES: usize = SHOP_SLOTS + 2;
 const BASE_HEARTS: u32 = 3;
 const REROLL_BASE: u32 = 10;
 
@@ -206,7 +204,27 @@ pub struct Gem {
 #[derive(Clone, Debug)]
 pub struct Offer {
     pub upgrade: Upgrade,
+    /// The level this card grants, which names and prices it.
+    pub tier: u8,
     pub sold: bool,
+}
+
+impl Offer {
+    pub fn new(upgrade: Upgrade, tier: u8) -> Self {
+        Offer {
+            upgrade,
+            tier,
+            sold: false,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.upgrade.tier(self.tier).name
+    }
+
+    pub fn rarity(&self) -> Rarity {
+        self.upgrade.tier(self.tier).rarity
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -241,6 +259,10 @@ pub struct Game {
     pub gems: Vec<Gem>,
     pub gem_flash: f32,
     pub shield: u32,
+    /// Seconds left of Brake Pads at the start of a wave.
+    pub brake: f32,
+    /// Clean Slate has already forgiven a slip this wave.
+    slate_used: bool,
     pub shop: Option<Shop>,
     pub shop_sel: usize,
     pub shop_note: String,
@@ -402,6 +424,8 @@ impl Game {
             gems: Vec::new(),
             gem_flash: 0.0,
             shield: 0,
+            brake: 0.0,
+            slate_used: false,
             shop: None,
             shop_sel: 0,
             shop_note: String::new(),
@@ -647,6 +671,12 @@ impl Game {
             .rocks
             .iter()
             .any(|r| r.live && r.word.starts_with(&next));
+        if !any && self.upgrades.has(Upgrade::CleanSlate) && !self.slate_used {
+            self.slate_used = true;
+            self.banner = "SLIP FORGIVEN".to_string();
+            self.banner_t = 0.7;
+            return;
+        }
         if !any {
             self.miss = 0.32;
             self.fumbled = true;
@@ -777,6 +807,13 @@ impl Game {
 
     fn begin_wave(&mut self) {
         self.shield = self.upgrades.level(Upgrade::Ward) as u32;
+        let pads = self.upgrades.level(Upgrade::BrakePads);
+        self.brake = if pads > 0 {
+            Upgrade::brake_secs(pads)
+        } else {
+            0.0
+        };
+        self.slate_used = false;
         self.budget = 5 + self.wave * 2;
         self.spawn_timer = 0.35;
         self.pending_clear = false;
@@ -792,7 +829,13 @@ impl Game {
     fn integrate_rocks(&mut self, dt: f32, collide: bool) {
         let (sx, sy) = self.ship_pos();
         let mut hits = Vec::new();
-        let pace = 1.0 - 0.1 * self.upgrades.level(Upgrade::SlowTide) as f32;
+        let mut pace = 1.0 - 0.1 * self.upgrades.level(Upgrade::SlowTide) as f32;
+        if self.brake > 0.0 {
+            pace *= 0.35;
+        }
+        if self.lives == 1 && self.upgrades.has(Upgrade::LastStand) {
+            pace *= 0.8;
+        }
         // Focus slows only the hazard being typed.
         let focus = Upgrade::focus_pace(self.upgrades.level(Upgrade::Focus));
         let typed = if collide { self.target } else { None };
@@ -956,8 +999,12 @@ impl Game {
             rock.hit = 0.14;
         }
         if kill {
+            let before = self.kills;
             self.detonate(id, &word, radius, tx, ty);
             self.chain_kills(tx, ty);
+            if self.upgrades.has(Upgrade::Sweeper) && self.kills / 20 != before / 20 {
+                self.sweep(tx, ty);
+            }
         }
     }
 
@@ -980,7 +1027,8 @@ impl Game {
             && initial == self.last_initial;
         self.last_initial = initial;
         let big = self.upgrades.has(Upgrade::BigGame) && word.len() >= 7;
-        let bonus = 1 + echo as u32 + big as u32;
+        let last_stand = self.lives == 1 && self.upgrades.has(Upgrade::LastStand);
+        let bonus = 1 + echo as u32 + big as u32 + last_stand as u32;
         let clean = !self.fumbled;
         self.fumbled = false;
         let steady = if clean {
@@ -1011,8 +1059,12 @@ impl Game {
             + self.upgrades.level(Upgrade::Prospector) as u32
             + echo as u32
             + steady
-            + if big { 2 } else { 0 };
-        self.drop_gems(x, y, crystals);
+            + if big { 2 } else { 0 }
+            + (self.combo >= 5 && self.upgrades.has(Upgrade::Bounty)) as u32;
+        let luck = Upgrade::lucky_chance(self.upgrades.level(Upgrade::LuckyPenny));
+        let lucky = luck > 0.0 && self.rng.f32() < luck;
+        self.drop_gems(x, y, crystals * (1 + lucky as u32));
+        self.shove_neighbors(id, x, y);
         self.kills += 1;
         if self.upgrades.has(Upgrade::Leech)
             && self.kills / 12 != (self.kills - 1) / 12
@@ -1070,6 +1122,47 @@ impl Game {
             });
             self.detonate(id, &word, radius, rx, ry);
         }
+    }
+
+    /// Shrapnel: a kill throws nearby hazards back, harder the closer they were.
+    fn shove_neighbors(&mut self, id: u32, x: f32, y: f32) {
+        let level = self.upgrades.level(Upgrade::Shrapnel);
+        if level == 0 {
+            return;
+        }
+        let reach = Upgrade::shrapnel_radius(level);
+        for rock in self.rocks.iter_mut().filter(|r| r.live && r.id != id) {
+            let (dx, dy) = (rock.x - x, rock.y - y);
+            let dist = (dx * dx + dy * dy).sqrt().max(0.01);
+            if dist < reach {
+                let push = (reach - dist) * 0.7;
+                rock.x += dx / dist * push;
+                rock.y += dy / dist * push;
+            }
+        }
+    }
+
+    /// Sweeper: detonate every other live hazard on screen.
+    fn sweep(&mut self, x: f32, y: f32) {
+        let all: Vec<(u32, String, f32, f32, f32)> = self
+            .rocks
+            .iter()
+            .filter(|r| r.live)
+            .map(|r| (r.id, r.word.clone(), r.radius, r.x, r.y))
+            .collect();
+        for (id, word, radius, rx, ry) in all {
+            self.effects.push(Effect::Laser {
+                x0: x,
+                y0: y,
+                x1: rx,
+                y1: ry,
+                life: 0.3,
+                max: 0.3,
+            });
+            self.detonate(id, &word, radius, rx, ry);
+        }
+        self.banner = "SWEPT CLEAN".to_string();
+        self.banner_t = 0.9;
     }
 
     fn drop_gems(&mut self, x: f32, y: f32, count: u32) {
@@ -1235,8 +1328,23 @@ impl Game {
         self.open_shop(false);
     }
 
+    /// Cards on the shelf: three, or four with Wide Shop.
+    pub fn shop_slots(&self) -> usize {
+        SHOP_SLOTS + self.upgrades.has(Upgrade::WideShop) as usize
+    }
+
+    /// Menu index of the reroll button; the next-wave button follows it.
+    pub fn shop_reroll_index(&self) -> usize {
+        self.shop_slots()
+    }
+
+    pub fn shop_go_index(&self) -> usize {
+        self.shop_slots() + 1
+    }
+
     pub fn shop_move(&mut self, delta: isize) {
-        self.shop_sel = (self.shop_sel as isize + delta).rem_euclid(SHOP_ENTRIES as isize) as usize;
+        let entries = self.shop_slots() as isize + 2;
+        self.shop_sel = (self.shop_sel as isize + delta).rem_euclid(entries) as usize;
     }
 
     /// Enter the shop. `pay_interest` is false when resuming a saved shop.
@@ -1271,33 +1379,43 @@ impl Game {
         }
     }
 
+    /// The card a shop would show for this line: its next level.
+    fn next_card(&self, up: Upgrade) -> Offer {
+        Offer::new(up, self.upgrades.level(up) + 1)
+    }
+
     fn roll_offers(&mut self) -> Vec<Offer> {
         let mut pool: Vec<Upgrade> = Upgrade::ALL
             .into_iter()
             .filter(|&u| self.eligible(u))
             .collect();
         let mut offers = Vec::new();
-        while offers.len() < SHOP_SLOTS && !pool.is_empty() {
-            let total: f32 = pool.iter().map(|u| u.def().rarity.weight()).sum();
+        let weight = |g: &Game, u: Upgrade| g.next_card(u).rarity().weight();
+        while offers.len() < self.shop_slots() && !pool.is_empty() {
+            let total: f32 = pool.iter().map(|&u| weight(self, u)).sum();
             let mut roll = self.rng.f32() * total;
             let mut pick = pool.len() - 1;
-            for (i, u) in pool.iter().enumerate() {
-                roll -= u.def().rarity.weight();
+            for (i, &u) in pool.iter().enumerate() {
+                roll -= weight(self, u);
                 if roll <= 0.0 {
                     pick = i;
                     break;
                 }
             }
-            offers.push(Offer {
-                upgrade: pool.remove(pick),
-                sold: false,
-            });
+            let up = pool.remove(pick);
+            offers.push(self.next_card(up));
         }
         offers
     }
 
-    pub fn upgrade_cost(&self, up: Upgrade) -> u32 {
-        up.cost(self.upgrades.level(up))
+    /// What a card costs right now, after Discount.
+    pub fn offer_cost(&self, offer: &Offer) -> u32 {
+        let off = Upgrade::discount_off(self.upgrades.level(Upgrade::Discount));
+        offer
+            .upgrade
+            .cost(offer.tier - 1)
+            .saturating_sub(off)
+            .max(1)
     }
 
     pub fn reroll_cost(&self) -> u32 {
@@ -1317,12 +1435,12 @@ impl Game {
         let Some(offer) = self.shop.as_ref().and_then(|s| s.offers.get(slot)) else {
             return;
         };
-        let up = offer.upgrade;
+        let (up, tier) = (offer.upgrade, offer.tier);
         if offer.sold {
             self.shop_note = "Already bought.".to_string();
             return;
         }
-        let cost = self.upgrade_cost(up);
+        let cost = self.offer_cost(offer);
         if self.crystals < cost {
             self.shop_note = format!("Need {} more crystals.", cost - self.crystals);
             return;
@@ -1334,19 +1452,20 @@ impl Game {
             _ => {}
         }
         self.upgrades.add(up);
-        // Stackable upgrades stay on the shelf until they hit their cap.
-        let restock = !up.def().consumable && !self.upgrades.maxed(up);
+        // The card stays sold: the next tier has to roll in on a later shop
+        // or reroll.
+        let name = up.tier(tier).name;
         if let Some(offer) = self.shop.as_mut().and_then(|s| s.offers.get_mut(slot)) {
-            offer.sold = !restock;
+            offer.sold = true;
         }
         self.shop_note = if self
             .shop
             .as_ref()
             .is_some_and(|s| s.offers.iter().all(|o| o.sold))
         {
-            format!("Bought {}. Sold out: reroll or head on.", up.def().name)
+            format!("Bought {name}. Sold out: reroll or head on.")
         } else {
-            format!("Bought {}.", up.def().name)
+            format!("Bought {name}.")
         };
         self.autosave(true);
     }
@@ -1366,6 +1485,10 @@ impl Game {
             return;
         }
         self.crystals -= cost;
+        let refund = Upgrade::recycler_refund(self.upgrades.level(Upgrade::Recycler));
+        if self.upgrades.has(Upgrade::Recycler) {
+            self.crystals += refund.min(cost);
+        }
         let offers = self.roll_offers();
         if let Some(shop) = self.shop.as_mut() {
             shop.rerolls += 1;
@@ -1376,10 +1499,13 @@ impl Game {
     }
 
     pub fn shop_activate(&mut self) {
-        match self.shop_sel {
-            SHOP_REROLL => self.shop_reroll(),
-            SHOP_GO => self.leave_shop(),
-            slot => self.shop_buy(slot),
+        let sel = self.shop_sel;
+        if sel == self.shop_reroll_index() {
+            self.shop_reroll();
+        } else if sel == self.shop_go_index() {
+            self.leave_shop();
+        } else {
+            self.shop_buy(sel);
         }
     }
 
@@ -1729,6 +1855,7 @@ impl Game {
         self.invuln = (self.invuln - dt).max(0.0);
         self.banner_t = (self.banner_t - dt).max(0.0);
         self.gem_flash = (self.gem_flash - dt).max(0.0);
+        self.brake = (self.brake - dt).max(0.0);
         if self.combo > 0 && self.phase == Phase::Playing {
             self.combo_left -= dt;
             if self.combo_left <= 0.0 {
@@ -1990,10 +2117,7 @@ mod tests {
     fn buying_spends_crystals_and_applies_the_upgrade() {
         let mut g = playing();
         g.open_shop(false);
-        g.shop.as_mut().unwrap().offers[0] = Offer {
-            upgrade: Upgrade::ExtraHeart,
-            sold: false,
-        };
+        g.shop.as_mut().unwrap().offers[0] = Offer::new(Upgrade::ExtraHeart, 1);
         g.crystals = 3;
         g.shop_buy(0);
         assert_eq!(g.crystals, 3, "too poor");
@@ -2003,18 +2127,13 @@ mod tests {
         assert_eq!(g.crystals, 40 - Upgrade::ExtraHeart.cost(0));
         assert_eq!(g.max_lives(), 4);
         assert_eq!(g.lives, 4);
-        // Stackable: still for sale, at a higher price.
-        assert!(!g.shop.as_ref().unwrap().offers[0].sold);
-        assert_eq!(
-            g.upgrade_cost(Upgrade::ExtraHeart),
-            Upgrade::ExtraHeart.cost(1)
-        );
+        // The card stays sold; the next tier costs more and has to roll in.
+        assert!(g.shop.as_ref().unwrap().offers[0].sold);
+        let next = g.next_card(Upgrade::ExtraHeart);
+        assert_eq!(next.tier, 2);
+        assert_eq!(g.offer_cost(&next), Upgrade::ExtraHeart.cost(1));
 
-        // One-offs sell out.
-        g.shop.as_mut().unwrap().offers[1] = Offer {
-            upgrade: Upgrade::SecondWind,
-            sold: false,
-        };
+        g.shop.as_mut().unwrap().offers[1] = Offer::new(Upgrade::SecondWind, 1);
         g.shop_buy(1);
         let before = g.crystals;
         g.shop_buy(1);
@@ -2025,7 +2144,7 @@ mod tests {
     fn a_shop_with_nothing_left_says_sold_out() {
         let mut g = playing();
         for up in Upgrade::ALL {
-            g.upgrades.set(up, up.def().max);
+            g.upgrades.set(up, up.max());
         }
         g.lives = g.max_lives();
         g.crystals = 100;
@@ -2081,24 +2200,177 @@ mod tests {
     }
 
     #[test]
-    fn stackable_upgrades_stay_for_sale_until_maxed() {
+    fn stackable_lines_sell_one_tier_at_a_time() {
         let mut g = playing();
         g.open_shop(false);
         g.crystals = 500;
-        g.shop.as_mut().unwrap().offers[0] = Offer {
-            upgrade: Upgrade::SlowTide,
-            sold: false,
-        };
-        let cap = Upgrade::SlowTide.def().max;
-        for level in 1..=cap {
-            g.shop_buy(0);
-            assert_eq!(g.upgrades.level(Upgrade::SlowTide), level);
-            let sold = g.shop.as_ref().unwrap().offers[0].sold;
-            assert_eq!(sold, level == cap, "level {level}");
-        }
+        g.shop.as_mut().unwrap().offers[0] = Offer::new(Upgrade::SlowTide, 1);
+        g.shop_buy(0);
+        assert_eq!(g.upgrades.level(Upgrade::SlowTide), 1);
+        assert!(g.shop.as_ref().unwrap().offers[0].sold, "no restock");
         let held = g.crystals;
         g.shop_buy(0);
-        assert_eq!(g.crystals, held, "nothing past the cap");
+        assert_eq!(g.crystals, held, "cannot buy the same card twice");
+
+        // Later shops only offer the next tier of the line.
+        for _ in 0..30 {
+            let offers = g.roll_offers();
+            for o in offers.iter().filter(|o| o.upgrade == Upgrade::SlowTide) {
+                assert_eq!(o.tier, 2);
+                assert_eq!(o.name(), "DEEP CURRENT");
+            }
+        }
+        g.upgrades.set(Upgrade::SlowTide, Upgrade::SlowTide.max());
+        assert!(!g.eligible(Upgrade::SlowTide), "nothing past the last tier");
+    }
+
+    #[test]
+    fn every_card_has_its_own_short_name() {
+        let mut seen = Vec::new();
+        for up in Upgrade::ALL {
+            for tier in up.def().tiers {
+                assert!(tier.name.chars().count() <= 12, "{} too long", tier.name);
+                assert!(!seen.contains(&tier.name), "{} repeats", tier.name);
+                seen.push(tier.name);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_shop_adds_a_fourth_card() {
+        let mut g = playing();
+        assert_eq!(g.shop_slots(), 3);
+        g.upgrades.set(Upgrade::WideShop, 1);
+        g.open_shop(false);
+        assert_eq!(g.shop_slots(), 4);
+        assert_eq!(g.shop.as_ref().unwrap().offers.len(), 4);
+        assert_eq!(g.shop_reroll_index(), 4);
+        assert_eq!(g.shop_go_index(), 5);
+        g.shop_sel = 5;
+        g.shop_move(1);
+        assert_eq!(g.shop_sel, 0, "selection wraps over cards and buttons");
+    }
+
+    #[test]
+    fn discount_and_recycler_change_what_shopping_costs() {
+        let mut g = playing();
+        let card = Offer::new(Upgrade::SteadyHands, 1);
+        let full = g.offer_cost(&card);
+        g.upgrades.set(Upgrade::Discount, 2);
+        assert_eq!(g.offer_cost(&card), full - 4);
+        assert_eq!(g.offer_cost(&Offer::new(Upgrade::PatchKit, 1)), 4);
+
+        g.upgrades.set(Upgrade::Recycler, 1);
+        g.open_shop(false);
+        g.crystals = 50;
+        g.shop_reroll();
+        assert_eq!(g.crystals, 50 - REROLL_BASE + Upgrade::recycler_refund(1));
+    }
+
+    #[test]
+    fn brake_pads_slow_a_new_wave() {
+        let mut g = with_rock("planet");
+        g.rocks[0].vx = -10.0;
+        let x0 = g.rocks[0].x;
+        g.integrate_rocks(0.1, false);
+        let plain = x0 - g.rocks[0].x;
+
+        let mut b = with_rock("planet");
+        b.upgrades.set(Upgrade::BrakePads, 1);
+        b.begin_wave();
+        assert_eq!(b.brake, Upgrade::brake_secs(1));
+        b.rocks.clear();
+        let rock = b.make_rock(60.0, 10.0, 2.0, "planet".to_string());
+        b.rocks.push(rock);
+        b.rocks[0].vx = -10.0;
+        b.integrate_rocks(0.1, false);
+        assert!(x0 - b.rocks[0].x < plain * 0.5);
+        for _ in 0..80 {
+            b.update(0.05);
+        }
+        assert_eq!(b.brake, 0.0);
+    }
+
+    #[test]
+    fn clean_slate_forgives_one_slip_per_wave() {
+        let mut g = with_rock("planet");
+        g.upgrades.set(Upgrade::CleanSlate, 1);
+        g.begin_wave();
+        g.type_char('z');
+        assert_eq!(g.miss, 0.0);
+        assert!(g.banner.contains("FORGIVEN"));
+        g.type_char('z');
+        assert!(g.miss > 0.0, "the second slip counts");
+    }
+
+    #[test]
+    fn last_stand_and_bounty_pay_out_in_their_moments() {
+        let mut base = with_rock("planet");
+        type_word(&mut base, "planet");
+
+        let mut stand = with_rock("planet");
+        stand.upgrades.set(Upgrade::LastStand, 1);
+        stand.lives = 1;
+        type_word(&mut stand, "planet");
+        assert_eq!(stand.score, base.score * 2);
+
+        let mut calm = with_rock("planet");
+        calm.upgrades.set(Upgrade::LastStand, 1);
+        type_word(&mut calm, "planet");
+        assert_eq!(calm.score, base.score, "only at one heart");
+
+        let mut hot = with_rock("planet");
+        hot.upgrades.set(Upgrade::Bounty, 1);
+        hot.combo = 4;
+        type_word(&mut hot, "planet");
+        let mut cold = with_rock("planet");
+        cold.upgrades.set(Upgrade::Bounty, 1);
+        type_word(&mut cold, "planet");
+        assert_eq!(hot.gems.len(), cold.gems.len() + 1);
+    }
+
+    #[test]
+    fn lucky_penny_sometimes_doubles_a_drop() {
+        let mut plain = 0;
+        let mut lucky = 0;
+        for seed in 0..60 {
+            let mut a = with_rock("star");
+            a.rng = Rng(seed * 7919 + 11);
+            type_word(&mut a, "star");
+            plain += a.gems.len();
+            let mut b = with_rock("star");
+            b.rng = Rng(seed * 7919 + 11);
+            b.upgrades.set(Upgrade::LuckyPenny, 2);
+            type_word(&mut b, "star");
+            lucky += b.gems.len();
+        }
+        assert!(lucky > plain, "{lucky} vs {plain}");
+        assert!(lucky < plain * 2, "only some drops double");
+    }
+
+    #[test]
+    fn shrapnel_shoves_close_hazards_back() {
+        let mut g = with_rock("planet");
+        g.upgrades.set(Upgrade::Shrapnel, 1);
+        let rock = g.make_rock(64.0, 10.0, 1.8, "cat".to_string());
+        g.rocks.push(rock);
+        type_word(&mut g, "planet");
+        let cat = g.rocks.iter().find(|r| r.word == "cat").unwrap();
+        assert!(cat.x > 64.0, "pushed away from the blast at x = 60");
+    }
+
+    #[test]
+    fn sweeper_clears_the_screen_on_every_twentieth_kill() {
+        let mut g = with_rock("planet");
+        g.upgrades.set(Upgrade::Sweeper, 1);
+        for (x, word) in [(30.0, "cat"), (40.0, "moon"), (50.0, "orbit")] {
+            let rock = g.make_rock(x, 20.0, 1.8, word.to_string());
+            g.rocks.push(rock);
+        }
+        g.kills = 19;
+        type_word(&mut g, "planet");
+        assert!(g.rocks.iter().all(|r| !r.live) || g.rocks.is_empty());
+        assert_eq!(g.kills, 23);
     }
 
     /// A kill target plus short and long bystanders, for Multishot tests.

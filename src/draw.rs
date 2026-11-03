@@ -1,9 +1,7 @@
 //! Space, underwater, and jungle scenes. Ships, hazards, and projectiles are
 //! braille line art; words sit on top in plain cells so they stay readable.
 
-use crate::game::{
-    metrics, rotate, Effect, Game, Metrics, Phase, Rock, Theme, SHOP_GO, SHOP_REROLL, SHOP_SLOTS,
-};
+use crate::game::{metrics, rotate, Effect, Game, Metrics, Phase, Rock, Theme};
 use crate::upgrades::Rarity;
 
 mod bigfont;
@@ -1547,7 +1545,8 @@ fn draw_shop(
         return;
     };
     let gap = 2;
-    let cols = SHOP_SLOTS as i32;
+    let cols = game.shop_slots() as i32;
+    let gap = if cols > 3 { 1 } else { gap };
     let card_w = ((w as i32 - 4 - gap * (cols - 1)) / cols).clamp(14, 24);
     let total = card_w * cols + gap * (cols - 1);
     let left = (w as i32 - total) / 2;
@@ -1579,7 +1578,7 @@ fn draw_shop(
     );
 
     let cards_y = top + 3;
-    for slot in 0..SHOP_SLOTS {
+    for slot in 0..game.shop_slots() {
         let x = left + slot as i32 * (card_w + gap);
         let Some(offer) = shop.offers.get(slot) else {
             // Nothing left to sell: keep the slot on screen, clearly empty.
@@ -1606,14 +1605,15 @@ fn draw_shop(
             continue;
         };
         let def = offer.upgrade.def();
+        let rarity = offer.rarity();
         let selected = game.shop_sel == slot;
-        let rare = def.rarity == Rarity::Rare;
+        let rare = rarity == Rarity::Rare;
         let edge = if offer.sold {
             pal.dim
         } else if selected {
             pal.hot
         } else {
-            rarity_color(def.rarity, pal)
+            rarity_color(rarity, pal)
         };
         let glyphs = match (selected, rare) {
             (_, true) => ["╔", "╗", "╚", "╝", "═", "║"],
@@ -1638,7 +1638,7 @@ fn draw_shop(
         );
         let inner = (card_w - 4) as usize;
         let body = |col: Color| style(col).bg(fill);
-        let name = format!("{} {}", slot + 1, def.name);
+        let name = format!("{} {}", slot + 1, offer.name());
         let name: String = name.chars().take(inner).collect();
         let name_col = if offer.sold { pal.dim } else { pal.ink };
         put(
@@ -1649,9 +1649,9 @@ fn draw_shop(
             body(name_col).add_modifier(Modifier::BOLD),
         );
         let tag = if rare {
-            format!("★ {}", def.rarity.label())
+            format!("★ {}", rarity.label())
         } else {
-            def.rarity.label().to_string()
+            rarity.label().to_string()
         };
         put(
             buf,
@@ -1661,13 +1661,11 @@ fn draw_shop(
             body(if offer.sold {
                 pal.dim
             } else {
-                rarity_color(def.rarity, pal)
+                rarity_color(rarity, pal)
             }),
         );
         let desc_rows = (card_h - 6).max(1) as usize;
-        let blurb = offer
-            .upgrade
-            .blurb(game.upgrades.level(offer.upgrade).saturating_add(1));
+        let blurb = offer.upgrade.blurb(offer.tier);
         for (i, line) in wrap(&blurb, inner).iter().take(desc_rows).enumerate() {
             put(
                 buf,
@@ -1687,7 +1685,7 @@ fn draw_shop(
                 body(pal.accent).add_modifier(Modifier::BOLD),
             );
         } else {
-            let cost = game.upgrade_cost(offer.upgrade);
+            let cost = game.offer_cost(offer);
             let afford = game.crystals >= cost;
             let price = format!("◆ {cost}");
             let px = x + card_w - 2 - price.chars().count() as i32;
@@ -1723,7 +1721,10 @@ fn draw_shop(
     let btn_total = (reroll.chars().count() + go.chars().count()) as i32 + btn_gap;
     let mut bx = (w as i32 - btn_total) / 2;
     let by = cards_y + card_h + 1;
-    for (idx, label) in [(SHOP_REROLL, reroll), (SHOP_GO, go)] {
+    for (idx, label) in [
+        (game.shop_reroll_index(), reroll),
+        (game.shop_go_index(), go),
+    ] {
         let selected = game.shop_sel == idx;
         let st = if selected {
             style(Color::Rgb(20, 16, 8))
@@ -1740,13 +1741,7 @@ fn draw_shop(
     let owned: Vec<String> = game
         .upgrades
         .held()
-        .map(|(up, level)| {
-            if up.def().max > 1 {
-                format!("{} {level}", up.def().name)
-            } else {
-                up.def().name.to_string()
-            }
-        })
+        .map(|(up, level)| up.tier(level).name.to_string())
         .collect();
     let line = if owned.is_empty() {
         "nothing installed yet".to_string()
@@ -2122,18 +2117,10 @@ mod tests {
             game.open_shop_for_test();
             game.crystals = 9;
             let shop = game.shop.as_mut().unwrap();
-            shop.offers[0] = Offer {
-                upgrade: Upgrade::SteadyHands,
-                sold: false,
-            };
-            shop.offers[1] = Offer {
-                upgrade: Upgrade::Multishot,
-                sold: false,
-            };
-            shop.offers[2] = Offer {
-                upgrade: Upgrade::SecondWind,
-                sold: true,
-            };
+            shop.offers[0] = Offer::new(Upgrade::SteadyHands, 1);
+            shop.offers[1] = Offer::new(Upgrade::Multishot, 1);
+            shop.offers[2] = Offer::new(Upgrade::SecondWind, 1);
+            shop.offers[2].sold = true;
             let screen = render(&game, 80, 24);
             assert!(screen.contains("CLEARED"), "{screen}");
             assert!(screen.contains("1 STEADY HANDS"), "{screen}");
@@ -2164,16 +2151,45 @@ mod tests {
     }
 
     #[test]
+    fn wide_shop_draws_four_cards_that_fit() {
+        use crate::game::Offer;
+        use crate::upgrades::Upgrade;
+        let mut game = locked_rock_game(Theme::Space, "comet");
+        game.rocks.clear();
+        game.upgrades.set(Upgrade::WideShop, 1);
+        game.open_shop_for_test();
+        game.crystals = 99;
+        let cards = [
+            Offer::new(Upgrade::SteadyHands, 2),
+            Offer::new(Upgrade::Prospector, 1),
+            Offer::new(Upgrade::Focus, 2),
+            Offer::new(Upgrade::Shrapnel, 2),
+        ];
+        game.shop.as_mut().unwrap().offers = cards.to_vec();
+        let screen = render(&game, 80, 24);
+        for name in [
+            "1 IRON NERVES",
+            "2 PROSPECTOR",
+            "3 BLINKERS",
+            "4 CLUSTER BOMB",
+        ] {
+            assert!(screen.contains(name), "{name} missing\n{screen}");
+        }
+        assert!(screen.contains("NEXT WAVE"), "{screen}");
+    }
+
+    #[test]
     fn an_empty_shop_still_draws_sold_out_slots() {
         let mut game = locked_rock_game(Theme::Underwater, "comet");
         game.rocks.clear();
         for up in crate::upgrades::Upgrade::ALL {
-            game.upgrades.set(up, up.def().max);
+            game.upgrades.set(up, up.max());
         }
         game.lives = game.max_lives();
         game.open_shop_for_test();
         let screen = render(&game, 80, 24);
-        assert_eq!(screen.matches("SOLD OUT").count(), 3, "{screen}");
+        // Everything owned includes Wide Shop, so all four slots show.
+        assert_eq!(screen.matches("SOLD OUT").count(), 4, "{screen}");
         assert!(screen.contains("NEXT WAVE"), "{screen}");
         assert!(screen.contains("Sold out!"), "{screen}");
     }

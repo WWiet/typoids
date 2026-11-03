@@ -165,7 +165,7 @@ fn on_key(game: &mut Game, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Char('k' | 'K' | 'h' | 'H') | KeyCode::Up | KeyCode::Left => {
                 game.shop_move(-1);
             }
-            KeyCode::Char(c @ '1'..='3') => game.shop_buy(c as usize - '1' as usize),
+            KeyCode::Char(c @ '1'..='4') => game.shop_buy(c as usize - '1' as usize),
             KeyCode::Char('r' | 'R') => game.shop_reroll(),
             KeyCode::Char('n' | 'N' | ' ') => game.leave_shop(),
             KeyCode::Enter => game.shop_activate(),

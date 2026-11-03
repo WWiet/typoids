@@ -89,30 +89,37 @@ in a three-card shop that opens after every cleared wave (`Phase::Shop`).
 - **Crystals.** `detonate` calls `drop_gems`. Gems drift for 0.45s, then home
   to the ship in `update_gems`; arrival adds to `game.crystals`. After a wave is
   cleared any stragglers are banked instantly. They are not simulated in `draw`.
-- **Shop.** `open_shop` rolls `SHOP_SLOTS` distinct offers (`roll_offers`,
-  weighted by `Rarity::weight`, skipping maxed or pointless ones via
-  `eligible`). Buying, rerolling and leaving go through `shop_buy`,
-  `shop_reroll` and `leave_shop`; the shop never touches typing state.
-  Shop keys live in `main.rs`: `h`/`l`, `1`-`3`, `r`, `Enter`, `space`.
-- **Upgrades are data plus one hook each.** `upgrades.rs` holds the catalog.
-  The simulation reads levels with `self.upgrades.level(Upgrade::X)` /
-  `.has(...)` at the point the effect applies (see `detonate`, `chain_kills`, `integrate_rocks`, `collide`, `begin_wave`,
-  `open_shop`). Never store an effect flag that duplicates a level.
-- **Adding an upgrade.** (1) add the variant to `Upgrade`, `Upgrade::ALL`,
-  `COUNT`, and a `DEFS` entry in the same order; keep the description under
-  about 55 characters so it wraps into four short lines on a card; (2) add its
-  hook in `game.rs` and a focused test; (3) if it changes what the player sees,
-  update `draw.rs` and add a render assertion. Save files use the `key` string,
-  so never rename a key.
-- **Rarity and cost.** Rare upgrades should be rule-benders, not bigger
-  numbers. Most are single level; a rare may stack when each level deepens the
-  rule (Focus slows the typed word more, Scattershot adds Multishot targets).
-  An upgrade that only improves another must gate itself in `eligible`.
-- **Level-aware card text.** `Upgrade::blurb(next_level)` spells out the next
-  step for stacking upgrades (Multishot letters, Scattershot words, Focus
-  speed). Put such numbers in the shared helper next to it
-  (`multishot_letters`, `focus_pace`) so the card and the simulation agree. Cost is
-  `Rarity::base_cost + 2 per level held`; patch kits are flat.
+- **Shop.** `open_shop` rolls `shop_slots()` distinct lines (three, four with
+  Wide Shop) via `roll_offers`, weighted by the rarity of each line's *next
+  tier* and skipping maxed or pointless ones via `eligible`. Buying, rerolling
+  and leaving go through `shop_buy`, `shop_reroll` and `leave_shop`; the shop
+  never touches typing state. A bought card stays sold: the next tier has to
+  roll in on a later shop or reroll. Menu indices come from `shop_slots()`,
+  `shop_reroll_index()` and `shop_go_index()`, never constants. Shop keys live
+  in `main.rs`: `h`/`l`, `1`-`4`, `r`, `Enter`, `space`.
+- **Lines and tiers.** `upgrades.rs` holds the catalog. An `Upgrade` is a line
+  of cards; every level is its own card (`Def::tiers`: name and rarity), so
+  Slow Tide, Deep Current and Still Water are three cards in one line. The
+  line's maximum is `tiers.len()`. An `Offer` carries the `tier` it grants.
+  The simulation still reads the *level held* with
+  `self.upgrades.level(Upgrade::X)` / `.has(...)` at the point the effect
+  applies (see `detonate`, `chain_kills`, `integrate_rocks`, `collide`,
+  `begin_wave`, `open_shop`, `shop_reroll`). Never store an effect flag that
+  duplicates a level.
+- **Adding a card.** (1) New line: add the variant to `Upgrade`, `Upgrade::ALL`,
+  `COUNT` and a `DEFS` entry in the same order. New tier: add a `t(name, rarity)`
+  to the line. Names must be unique and at most 12 characters (four cards share
+  80 columns); descriptions stay under about 55 characters. (2) Add the hook in
+  `game.rs` and a focused test. (3) If a number scales with level, put it in a
+  helper next to `Upgrade::blurb` (`multishot_letters`, `shrapnel_radius`, ...)
+  so the card text and the simulation agree. (4) If it changes what the player
+  sees, update `draw.rs` and add a render assertion. Save files use the line's
+  `key` and level, so never rename a key or reorder tiers.
+- **Rarity and cost.** Rare cards should be rule-benders, not bigger numbers.
+  Later tiers of a line are usually rarer than earlier ones. A card costs
+  `Rarity::base_cost` of its tier plus 2 per level already held; patch kits are
+  flat, and Discount lowers every price (never below 1). An upgrade that only
+  improves another must gate itself in `eligible`.
 - **Saves.** `~/.typoids-run` holds a `RunSave` (wave, score, lives, crystals,
   kills, revive flag, upgrades, and whether to resume in the shop). It is
   written when the shop opens, after each purchase or reroll, and by
@@ -278,7 +285,7 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
   helper and assert on the resulting text (e.g. menu labels and hint copy).
   Add a render assertion when you add player-visible strings or theme visuals.
 - Every behavior change should add or update a focused test. Keep the suite
-  green; currently 49 tests.
+  green; currently 59 tests.
 
 ## Gotchas
 

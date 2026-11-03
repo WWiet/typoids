@@ -1,5 +1,10 @@
 //! The roguelike upgrade catalog. Pure data plus tiny helpers; the simulation
 //! in `game.rs` decides what each upgrade does.
+//!
+//! An `Upgrade` is a *line* of cards. Each level of a line is its own card with
+//! its own name and rarity (`Def::tiers`), and the shop only ever offers the
+//! next one, so a bought card never restocks itself: the next tier has to
+//! roll in on a later shop or reroll.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Rarity {
@@ -28,9 +33,9 @@ impl Rarity {
 
     fn base_cost(self) -> u32 {
         match self {
-            Rarity::Common => 6,
-            Rarity::Uncommon => 10,
-            Rarity::Rare => 16,
+            Rarity::Common => 8,
+            Rarity::Uncommon => 16,
+            Rarity::Rare => 28,
         }
     }
 }
@@ -53,35 +58,48 @@ pub enum Upgrade {
     Haggler,
     Leech,
     Scattershot,
+    BrakePads,
+    LuckyPenny,
+    CleanSlate,
+    Shrapnel,
+    LastStand,
+    Recycler,
+    Bounty,
+    Sweeper,
+    Discount,
+    WideShop,
 }
 
-pub const COUNT: usize = 16;
+pub const COUNT: usize = 26;
+
+/// One level of a line: the card the shop shows for it.
+pub struct Tier {
+    pub name: &'static str,
+    pub rarity: Rarity,
+}
 
 pub struct Def {
     /// Stable id used in save files.
     pub key: &'static str,
-    pub name: &'static str,
+    /// Card text for single-level lines; stacking lines use `Upgrade::blurb`.
     pub desc: &'static str,
-    pub rarity: Rarity,
-    /// Most levels a run can hold.
-    pub max: u8,
+    /// One card per level, in order. The line's maximum level is `tiers.len()`.
+    pub tiers: &'static [Tier],
     /// Applied once on purchase and never held.
     pub consumable: bool,
 }
 
-const fn def(
-    key: &'static str,
-    name: &'static str,
-    desc: &'static str,
-    rarity: Rarity,
-    max: u8,
-) -> Def {
+use Rarity::{Common as C, Rare as R, Uncommon as U};
+
+const fn t(name: &'static str, rarity: Rarity) -> Tier {
+    Tier { name, rarity }
+}
+
+const fn def(key: &'static str, desc: &'static str, tiers: &'static [Tier]) -> Def {
     Def {
         key,
-        name,
         desc,
-        rarity,
-        max,
+        tiers,
         consumable: false,
     }
 }
@@ -90,118 +108,159 @@ const fn def(
 const DEFS: [Def; COUNT] = [
     def(
         "steadyhands",
-        "STEADY HANDS",
-        "Words typed with no slips: +25% score, +1 crystal.",
-        Rarity::Common,
-        3,
+        "Words with no slips: more score and crystals.",
+        &[t("STEADY HANDS", C), t("IRON NERVES", U), t("METRONOME", R)],
     ),
     def(
         "prospector",
-        "PROSPECTOR",
-        "Every kill drops one more crystal.",
-        Rarity::Common,
-        5,
+        "Every kill drops more crystals.",
+        &[
+            t("PROSPECTOR", C),
+            t("GOLD PAN", C),
+            t("PICKAXE", U),
+            t("MINING RIG", U),
+            t("MOTHERLODE", R),
+        ],
     ),
     def(
         "slowtide",
-        "SLOW TIDE",
-        "Hazards drift 10% slower.",
-        Rarity::Common,
-        5,
+        "Hazards drift slower.",
+        &[
+            t("SLOW TIDE", C),
+            t("DEEP CURRENT", C),
+            t("STILL WATER", U),
+            t("DEAD CALM", U),
+            t("FROZEN TIME", R),
+        ],
     ),
     def(
         "longfuse",
-        "LONG FUSE",
-        "Combos last 1.5s longer.",
-        Rarity::Common,
-        4,
+        "Combos last longer.",
+        &[
+            t("LONG FUSE", C),
+            t("SLOW BURN", C),
+            t("STEADY FLAME", U),
+            t("INFERNO", R),
+        ],
     ),
     Def {
         consumable: true,
-        ..def(
-            "patchkit",
-            "PATCH KIT",
-            "Restore one heart.",
-            Rarity::Common,
-            255,
-        )
+        ..def("patchkit", "Restore one heart.", &[t("PATCH KIT", C)])
     },
     def(
         "extraheart",
-        "EXTRA HEART",
         "+1 max heart, and heal one.",
-        Rarity::Uncommon,
-        3,
+        &[t("EXTRA HEART", U), t("SPARE HEART", U), t("IRON HEART", R)],
     ),
     def(
         "multishot",
-        "MULTISHOT",
         "Kills also pop the nearest short word.",
-        Rarity::Uncommon,
-        4,
+        &[
+            t("MULTISHOT", U),
+            t("LONG BARREL", U),
+            t("WIDE BORE", R),
+            t("GRAND SLAM", R),
+        ],
     ),
     def(
         "ward",
-        "WARD",
-        "Absorb one hit at the start of each wave.",
-        Rarity::Uncommon,
-        3,
+        "Absorb hits at the start of each wave.",
+        &[t("WARD", U), t("GUARD", U), t("BULWARK", R)],
     ),
     def(
         "interest",
-        "COMPOUND INTEREST",
         "Earn 1 crystal per 5 held after each wave (max 5).",
-        Rarity::Rare,
-        1,
+        &[t("INTEREST", R)],
     ),
     def(
         "alliteration",
-        "ALLITERATION",
         "Same first letter twice in a row: 2x score, +1 crystal.",
-        Rarity::Rare,
-        1,
+        &[t("ALLITERATION", R)],
     ),
     def(
         "secondwind",
-        "SECOND WIND",
         "Survive your first fatal hit with one heart.",
-        Rarity::Rare,
-        1,
+        &[t("SECOND WIND", R)],
     ),
     def(
         "focus",
-        "FOCUS",
         "The word you are typing slows down.",
-        Rarity::Rare,
-        4,
+        &[
+            t("FOCUS", U),
+            t("BLINKERS", R),
+            t("LASER FOCUS", R),
+            t("ZEN MASTER", R),
+        ],
     ),
     def(
         "biggame",
-        "BIG GAME",
         "Words of 7+ letters: 2x score, +2 crystals.",
-        Rarity::Rare,
-        1,
+        &[t("BIG GAME", R)],
     ),
     def(
         "haggler",
-        "HAGGLER",
         "The first reroll in every shop is free.",
-        Rarity::Rare,
-        1,
+        &[t("HAGGLER", R)],
     ),
     def(
         "leech",
-        "LEECH",
         "Every 12 kills, restore one heart.",
-        Rarity::Rare,
-        1,
+        &[t("LEECH", R)],
     ),
     def(
         "scattershot",
-        "SCATTERSHOT",
         "Multishot pops more words per kill.",
-        Rarity::Rare,
-        3,
+        &[t("SCATTERSHOT", R), t("BUCKSHOT", R), t("FLAK STORM", R)],
+    ),
+    def(
+        "brakepads",
+        "Hazards crawl at the start of each wave.",
+        &[t("BRAKE PADS", C), t("DISC BRAKES", U)],
+    ),
+    def(
+        "luckypenny",
+        "Some kills drop double crystals.",
+        &[t("LUCKY PENNY", C), t("LUCKY CLOVER", U)],
+    ),
+    def(
+        "cleanslate",
+        "The first wrong key each wave is forgiven.",
+        &[t("CLEAN SLATE", U)],
+    ),
+    def(
+        "shrapnel",
+        "Kills shove nearby hazards away.",
+        &[t("SHRAPNEL", U), t("CLUSTER BOMB", R)],
+    ),
+    def(
+        "laststand",
+        "At one heart: hazards 20% slower, score doubled.",
+        &[t("LAST STAND", U)],
+    ),
+    def(
+        "recycler",
+        "Rerolls refund some crystals.",
+        &[t("RECYCLER", U), t("SCRAP YARD", R)],
+    ),
+    def(
+        "bounty",
+        "Kills at combo 5 or more drop one more crystal.",
+        &[t("BOUNTY", R)],
+    ),
+    def(
+        "sweeper",
+        "Every 20th kill detonates every hazard on screen.",
+        &[t("SWEEPER", R)],
+    ),
+    def(
+        "discount",
+        "Shop prices drop (never below 1).",
+        &[t("DISCOUNT", R), t("LOYALTY CARD", R)],
+    ),
+    def(
+        "wideshop",
+        "The shop offers a fourth card.",
+        &[t("WIDE SHOP", R)],
     ),
 ];
 
@@ -223,10 +282,31 @@ impl Upgrade {
         Upgrade::Haggler,
         Upgrade::Leech,
         Upgrade::Scattershot,
+        Upgrade::BrakePads,
+        Upgrade::LuckyPenny,
+        Upgrade::CleanSlate,
+        Upgrade::Shrapnel,
+        Upgrade::LastStand,
+        Upgrade::Recycler,
+        Upgrade::Bounty,
+        Upgrade::Sweeper,
+        Upgrade::Discount,
+        Upgrade::WideShop,
     ];
 
     pub fn def(self) -> &'static Def {
         &DEFS[self as usize]
+    }
+
+    /// Most levels a run can hold.
+    pub fn max(self) -> u8 {
+        self.def().tiers.len() as u8
+    }
+
+    /// The card for `level` (1-based, clamped into range).
+    pub fn tier(self, level: u8) -> &'static Tier {
+        let tiers = self.def().tiers;
+        &tiers[(level.max(1) as usize - 1).min(tiers.len() - 1)]
     }
 
     pub fn from_key(key: &str) -> Option<Self> {
@@ -243,32 +323,90 @@ impl Upgrade {
         1.0 / (1.0 + 0.5 * level as f32)
     }
 
-    /// Card text for the level you would have after buying. Stacking upgrades
+    /// Seconds hazards crawl at the start of a wave under Brake Pads.
+    pub fn brake_secs(level: u8) -> f32 {
+        1.0 + 2.0 * level as f32
+    }
+
+    /// Chance that a kill drops double crystals under Lucky Penny.
+    pub fn lucky_chance(level: u8) -> f32 {
+        0.15 * level as f32
+    }
+
+    /// Cells within which Shrapnel shoves hazards away.
+    pub fn shrapnel_radius(level: u8) -> f32 {
+        3.0 + 3.0 * level as f32
+    }
+
+    /// Crystals a reroll gives back under Recycler.
+    pub fn recycler_refund(level: u8) -> u32 {
+        1 + 2 * level as u32
+    }
+
+    /// Crystals taken off every shop price under Discount.
+    pub fn discount_off(level: u8) -> u32 {
+        2 * level as u32
+    }
+
+    /// Card text for the level you would have after buying. Lines that scale
     /// spell out their next step; the rest use the fixed description.
     pub fn blurb(self, next_level: u8) -> String {
-        let level = next_level.clamp(1, self.def().max);
+        let l = next_level.clamp(1, self.max());
+        let n = l as u32;
         match self {
+            Upgrade::SteadyHands => {
+                format!("Words with no slips: +{}% score, +{n} crystals.", 25 * n)
+            }
+            Upgrade::Prospector => format!("Every kill drops {n} extra crystal{}.", plural(n)),
+            Upgrade::SlowTide => format!("Hazards drift {}% slower.", 10 * n),
+            Upgrade::LongFuse => format!("Combos last {}s longer.", 1.5 * n as f32),
+            Upgrade::Ward => format!("Absorb {n} hit{} at the start of each wave.", plural(n)),
             Upgrade::Multishot => format!(
                 "Kills also pop the nearest word of {} letters or fewer.",
-                Self::multishot_letters(level)
+                Self::multishot_letters(l)
             ),
-            Upgrade::Scattershot => {
-                format!("Multishot pops {} words per kill.", 1 + level)
-            }
+            Upgrade::Scattershot => format!("Multishot pops {} words per kill.", 1 + n),
             Upgrade::Focus => format!(
                 "The word you type slows to {}% speed.",
-                (Self::focus_pace(level) * 100.0).round()
+                (Self::focus_pace(l) * 100.0).round()
+            ),
+            Upgrade::BrakePads => format!(
+                "Hazards crawl for the first {} seconds of each wave.",
+                Self::brake_secs(l)
+            ),
+            Upgrade::LuckyPenny => format!(
+                "{}% of kills drop double crystals.",
+                (Self::lucky_chance(l) * 100.0).round()
+            ),
+            Upgrade::Shrapnel => format!(
+                "Kills shove hazards within {} cells away.",
+                Self::shrapnel_radius(l)
+            ),
+            Upgrade::Recycler => {
+                format!("Each reroll refunds {} crystals.", Self::recycler_refund(l))
+            }
+            Upgrade::Discount => format!(
+                "Shop prices are {} lower (never below 1).",
+                Self::discount_off(l)
             ),
             _ => self.def().desc.to_string(),
         }
     }
 
-    /// Crystals needed to buy the next level when `owned` levels are held.
+    /// Crystals needed to buy the card at `owned + 1` before any discount.
     pub fn cost(self, owned: u8) -> u32 {
         if self.def().consumable {
-            return 5;
+            return 8;
         }
-        self.def().rarity.base_cost() + owned as u32 * 2
+        self.tier(owned + 1).rarity.base_cost() + owned as u32 * 2
+    }
+}
+
+fn plural(n: u32) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
@@ -286,19 +424,19 @@ impl Upgrades {
     }
 
     pub fn maxed(&self, up: Upgrade) -> bool {
-        !up.def().consumable && self.level(up) >= up.def().max
+        !up.def().consumable && self.level(up) >= up.max()
     }
 
     /// Adds a level, clamped to the upgrade's maximum. Consumables hold none.
     pub fn add(&mut self, up: Upgrade) {
         if !up.def().consumable {
             let slot = &mut self.0[up as usize];
-            *slot = (*slot + 1).min(up.def().max);
+            *slot = (*slot + 1).min(up.max());
         }
     }
 
     pub fn set(&mut self, up: Upgrade, level: u8) {
-        self.0[up as usize] = level.min(up.def().max);
+        self.0[up as usize] = level.min(up.max());
     }
 
     /// Held upgrades in catalog order, with their levels.
