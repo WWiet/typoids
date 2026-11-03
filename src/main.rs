@@ -1,3 +1,4 @@
+mod boss;
 mod draw;
 mod game;
 mod save;
@@ -12,9 +13,14 @@ use game::{
     PAUSE_RESTART,
 };
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use ratatui::crossterm::{execute, queue};
 
 /// How long the window size must hold still before the final repaint.
 const SETTLE: Duration = Duration::from_millis(250);
+/// Frame budget: 120 fps. A frame costs well under a millisecond to build, and
+/// braille motion looks noticeably smoother than at 60 on fast displays.
+const FRAME: Duration = Duration::from_micros(8_333);
 
 fn main() -> Result<()> {
     let mut terminal = ratatui::init();
@@ -32,6 +38,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let mut game = Game::new(size.width, size.height, seed);
     game.enable_persistence();
     let mut last = Instant::now();
+    let mut next_frame = last;
     let mut seen = size;
     // When a resize has settled, repaint everything once more.
     let mut repaint_at: Option<Instant> = None;
@@ -52,25 +59,48 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             repaint_at = None;
         }
         game.set_screen(size.width, size.height);
-        terminal.draw(|frame| draw::draw(frame, &game))?;
 
-        let timeout = Duration::from_millis(16);
-        if event::poll(timeout)? {
-            while event::poll(Duration::from_millis(0))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(key.code, KeyCode::Char('l' | 'L'))
-                        {
-                            // Ctrl+L: manual full repaint.
-                            terminal.clear()?;
-                            continue;
-                        }
-                        on_key(&mut game, key.code, key.modifiers)
+        // Simulate up to now, then show it, so a frame never lags the input.
+        let now = Instant::now();
+        let dt = (now - last).as_secs_f32();
+        last = now;
+        if game.phase != Phase::Paused {
+            game.update(dt);
+        } else {
+            game.update(0.0);
+            // Keep the cursor blinking on the pause screen without moving rocks.
+            game.time += dt.min(0.05);
+        }
+        present(terminal, &game)?;
+
+        // Wait for the next frame, handling input as it arrives. A keypress
+        // ends the wait early so typed letters show up at once.
+        next_frame = (next_frame + FRAME).max(Instant::now());
+        while event::poll(next_frame.saturating_duration_since(Instant::now()))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('l' | 'L'))
+                    {
+                        // Ctrl+L: manual full repaint.
+                        terminal.clear()?;
+                        continue;
                     }
-                    Event::Resize(..) => repaint_at = Some(Instant::now() + SETTLE),
-                    _ => {}
+                    on_key(&mut game, key.code, key.modifiers);
+                    // Take any keys already queued, then draw straight away.
+                    while event::poll(Duration::ZERO)? {
+                        match event::read()? {
+                            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                                on_key(&mut game, key.code, key.modifiers)
+                            }
+                            Event::Resize(..) => repaint_at = Some(Instant::now() + SETTLE),
+                            _ => {}
+                        }
+                    }
+                    break;
                 }
+                Event::Resize(..) => repaint_at = Some(Instant::now() + SETTLE),
+                _ => {}
             }
         }
 
@@ -78,19 +108,16 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             game.save_best();
             break;
         }
-
-        let dt = last.elapsed().as_secs_f32();
-        last = Instant::now();
-        if game.phase != Phase::Paused {
-            game.update(dt);
-        } else {
-            game.update(0.0);
-            // Keep the cursor blinking on the pause screen without moving rocks.
-            // update(0) still advances nothing meaningful; bump time for the blink.
-            game.time += dt.min(0.05);
-        }
     }
     Ok(())
+}
+
+/// Draw one frame inside a synchronized update, so the terminal shows it whole
+/// instead of tearing halfway through. Terminals without support ignore it.
+fn present(terminal: &mut ratatui::DefaultTerminal, game: &Game) -> Result<()> {
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    terminal.draw(|frame| draw::draw(frame, game))?;
+    execute!(terminal.backend_mut(), EndSynchronizedUpdate)
 }
 
 fn on_key(game: &mut Game, code: KeyCode, mods: KeyModifiers) {

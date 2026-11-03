@@ -1,5 +1,6 @@
 //! Simulation for TYPOIDS. The terminal shell only feeds keys and paints this.
 
+use crate::boss::{self, Boss};
 use crate::save::{self, RunSave};
 use crate::upgrades::{Rarity, Upgrade, Upgrades};
 use crate::words;
@@ -201,6 +202,19 @@ pub struct Gem {
     age: f32,
 }
 
+impl Gem {
+    #[cfg(test)]
+    pub fn resting(x: f32, y: f32) -> Self {
+        Gem {
+            x,
+            y,
+            vx: 0.0,
+            vy: 0.0,
+            age: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Offer {
     pub upgrade: Upgrade,
@@ -259,6 +273,8 @@ pub struct Game {
     pub gems: Vec<Gem>,
     pub gem_flash: f32,
     pub shield: u32,
+    /// The boss encounter on a boss wave; `None` on normal waves.
+    pub boss: Option<Boss>,
     /// Seconds left of Brake Pads at the start of a wave.
     pub brake: f32,
     /// Clean Slate has already forgiven a slip this wave.
@@ -424,6 +440,7 @@ impl Game {
             gems: Vec::new(),
             gem_flash: 0.0,
             shield: 0,
+            boss: None,
             brake: 0.0,
             slate_used: false,
             shop: None,
@@ -494,7 +511,23 @@ impl Game {
     }
 
     pub fn ship_center(&self) -> (f32, f32) {
-        (self.play_w * 0.5, self.play_h * 0.5)
+        // Against a boss the ship drops to the bottom, under the passage.
+        let y = if self.boss.is_some() { 0.86 } else { 0.5 };
+        (self.play_w * 0.5, self.play_h * y)
+    }
+
+    /// Where the boss hangs, top and centre of the play area.
+    /// Where the boss is now: its home spot plus its idle drift.
+    pub fn boss_pos(&self) -> (f32, f32) {
+        let (x, y) = self.boss_home();
+        let age = self.boss.as_ref().map_or(0.0, |b| b.age);
+        let (dx, dy) = boss::drift(self.theme, age, self.play_w, self.play_h);
+        (x + dx, y + dy)
+    }
+
+    /// The boss's resting spot; the passage panel is laid out from this.
+    pub fn boss_home(&self) -> (f32, f32) {
+        (self.play_w * 0.5, self.play_h * 0.3)
     }
 
     pub fn ship_pos(&self) -> (f32, f32) {
@@ -518,6 +551,9 @@ impl Game {
     }
 
     pub fn target_word(&self) -> Option<&str> {
+        if let Some(boss) = &self.boss {
+            return boss.word().filter(|_| boss.fighting());
+        }
         let id = self.target?;
         self.rocks
             .iter()
@@ -623,6 +659,7 @@ impl Game {
         self.gems.clear();
         self.gem_flash = 0.0;
         self.shield = 0;
+        self.boss = None;
         self.shop = None;
         self.shop_sel = 0;
         self.shop_note.clear();
@@ -665,6 +702,10 @@ impl Game {
         if !c.is_ascii_lowercase() {
             return;
         }
+        if self.boss.is_some() {
+            self.boss_type(c);
+            return;
+        }
         let mut next = self.buffer.clone();
         next.push(c);
         let any = self
@@ -697,7 +738,9 @@ impl Game {
     }
 
     pub fn backspace(&mut self) {
-        if self.phase != Phase::Playing || self.buffer.is_empty() {
+        // Against a boss only correct letters enter the buffer, so there is
+        // nothing to take back.
+        if self.phase != Phase::Playing || self.buffer.is_empty() || self.boss.is_some() {
             return;
         }
         self.buffer.pop();
@@ -779,6 +822,12 @@ impl Game {
             return;
         }
 
+        if self.boss.is_some() {
+            self.update_boss(dt);
+            self.aim_ship(dt, false);
+            return;
+        }
+
         self.spawn_timer -= dt;
         let cap = (3 + self.wave / 2).min(7) as usize;
         if self.budget > 0 && self.rocks.len() < cap && self.spawn_timer <= 0.0 {
@@ -814,6 +863,10 @@ impl Game {
             0.0
         };
         self.slate_used = false;
+        if boss::is_boss_wave(self.wave) {
+            self.start_boss();
+            return;
+        }
         self.budget = 5 + self.wave * 2;
         self.spawn_timer = 0.35;
         self.pending_clear = false;
@@ -886,7 +939,9 @@ impl Game {
     }
 
     fn aim_ship(&mut self, dt: f32, attract: bool) {
-        let desired = if !attract && self.buffer.is_empty() {
+        let desired = if !attract && self.boss.as_ref().is_some_and(|b| b.fighting()) {
+            Some(self.boss_pos())
+        } else if !attract && self.buffer.is_empty() {
             None
         } else if let Some(id) = self.target {
             self.rocks.iter().find(|r| r.id == id).map(|r| (r.x, r.y))
@@ -1292,6 +1347,18 @@ impl Game {
             self.clear_typed();
             return;
         }
+        self.lose_life(1.45);
+        self.clear_typed();
+        let kx = self.rng.range(-1.0, 1.0);
+        let ky = self.rng.range(-1.0, 1.0);
+        self.kick(kx, ky, 10.0);
+        self.burst(x, y, radius);
+        self.rocks.retain(|r| r.id != id);
+    }
+
+    /// Take one heart: Second Wind may save the run, otherwise the last heart
+    /// starts the death sequence. `invuln` is the grace period afterwards.
+    fn lose_life(&mut self, invuln: f32) {
         self.lives = self.lives.saturating_sub(1);
         if self.lives == 0 && self.upgrades.has(Upgrade::SecondWind) && !self.revive_used {
             self.revive_used = true;
@@ -1299,17 +1366,11 @@ impl Game {
             self.banner = "SECOND WIND".to_string();
             self.banner_t = 1.2;
         }
-        self.invuln = 1.45;
+        self.invuln = invuln;
         self.hurt = 0.5;
         self.shake = 0.45;
         self.combo = 0;
         self.combo_left = 0.0;
-        self.clear_typed();
-        let kx = self.rng.range(-1.0, 1.0);
-        let ky = self.rng.range(-1.0, 1.0);
-        self.kick(kx, ky, 10.0);
-        self.burst(x, y, radius);
-        self.rocks.retain(|r| r.id != id);
         if self.lives == 0 {
             self.phase = Phase::Dying;
             self.dying = 0.95;
@@ -1321,6 +1382,185 @@ impl Game {
             };
             self.banner_t = 0.95;
         }
+    }
+
+    fn start_boss(&mut self) {
+        self.rocks.clear();
+        self.budget = 0;
+        self.spawn_timer = 99.0;
+        self.pending_clear = false;
+        self.clear_typed();
+        let tier = boss::tier_of(self.wave);
+        let rng = &mut self.rng;
+        let boss = Boss::new(tier, |n| (rng.next() >> 33) as usize % n);
+        self.banner.clear();
+        self.banner_t = 0.0;
+        self.boss = Some(boss);
+    }
+
+    fn update_boss(&mut self, dt: f32) {
+        let Some(b) = self.boss.as_mut() else {
+            return;
+        };
+        if b.intro > 0.0 {
+            b.intro -= dt;
+            if b.intro <= 0.0 {
+                self.lock_t = self.time;
+            }
+            return;
+        }
+        if !b.active() {
+            return;
+        }
+        b.elapsed += dt;
+        if b.elapsed >= b.limit {
+            self.boss_timeout();
+        }
+    }
+
+    fn boss_type(&mut self, c: char) {
+        let Some(b) = self.boss.as_ref().filter(|b| b.fighting()) else {
+            return;
+        };
+        let Some(word) = b.word() else {
+            return;
+        };
+        let mut next = self.buffer.clone();
+        next.push(c);
+        if !word.starts_with(&next) {
+            self.boss_miss();
+            return;
+        }
+        self.buffer = next;
+        self.buffer_t.push(self.time);
+        if let Some(b) = self.boss.as_mut() {
+            b.chars_done += 1;
+        }
+        let (sx, sy) = self.ship_pos();
+        let (bx, by) = self.boss_pos();
+        let (fx, fy) = forward(self.angle);
+        self.effects.push(Effect::Laser {
+            x0: sx + fx * 1.9,
+            y0: sy + fy * 1.9,
+            x1: bx + self.rng.range(-2.0, 2.0),
+            y1: by,
+            life: 0.16,
+            max: 0.16,
+        });
+        self.thrust = 1.0;
+        self.kick(0.0, 1.0, 5.0);
+        if self.buffer == word {
+            self.boss_word_done(word);
+        }
+    }
+
+    fn boss_word_done(&mut self, word: &'static str) {
+        self.combo = self.combo.saturating_add(1);
+        self.combo_left = 3.4 + 1.5 * self.upgrades.level(Upgrade::LongFuse) as f32;
+        let pts = word.len() as u32 * 40 * self.combo.min(12);
+        self.score += pts;
+        if self.score > self.best {
+            self.best = self.score;
+            self.best_dirty = true;
+        }
+        let (bx, by) = self.boss_pos();
+        self.effects.push(Effect::Float {
+            x: bx,
+            y: by + 2.0,
+            life: 0.7,
+            max: 0.7,
+            text: format!("+{pts}"),
+        });
+        self.clear_typed();
+        self.spent = Some(Spent {
+            word: word.to_string(),
+            t0: self.time,
+        });
+        self.lock_t = self.time;
+        let Some(b) = self.boss.as_mut() else {
+            return;
+        };
+        b.chars_done += 1;
+        b.idx += 1;
+        if b.idx >= b.words.len() {
+            self.boss_win();
+        }
+    }
+
+    fn boss_miss(&mut self) {
+        if self.upgrades.has(Upgrade::CleanSlate) && !self.slate_used {
+            self.slate_used = true;
+            self.banner = "SLIP FORGIVEN".to_string();
+            self.banner_t = 0.7;
+            return;
+        }
+        self.miss = 0.32;
+        self.fumbled = true;
+        self.shake = self.shake.max(0.2);
+        if let Some(b) = self.boss.as_mut() {
+            b.strike = boss::STRIKE;
+        }
+        if self.invuln > 0.0 {
+            return;
+        }
+        if self.shield > 0 {
+            self.shield -= 1;
+            self.invuln = 0.6;
+            return;
+        }
+        // The strike lands, but the buffer keeps its correct letters.
+        self.lose_life(0.7);
+    }
+
+    fn boss_win(&mut self) {
+        let Some(b) = self.boss.as_mut() else {
+            return;
+        };
+        b.outcome = Some(true);
+        let tier = b.tier;
+        let wpm = (b.chars_total as f32 / 5.0 / (b.elapsed.max(1.0) / 60.0)).round() as u32;
+        let reward = 12 + 8 * tier;
+        self.crystals += reward;
+        self.score += 1000 * tier + wpm * 10;
+        if self.score > self.best {
+            self.best = self.score;
+            self.best_dirty = true;
+        }
+        self.lives = (self.lives + 1).min(self.max_lives());
+        self.banner = format!("BOSS DOWN  {wpm} WPM  +{reward} CRYSTALS");
+        self.banner_t = 2.2;
+        self.pending_clear = true;
+        self.clear_t = 2.4;
+        let (bx, by) = self.boss_pos();
+        for _ in 0..6 {
+            let (dx, dy) = (self.rng.range(-6.0, 6.0), self.rng.range(-2.0, 2.0));
+            self.burst(bx + dx, by + dy, 2.5);
+        }
+        self.shake = 0.6;
+    }
+
+    fn boss_timeout(&mut self) {
+        if let Some(b) = self.boss.as_mut() {
+            b.outcome = Some(false);
+        }
+        for _ in 0..boss::TIMEOUT_HEARTS {
+            if self.phase == Phase::Playing && self.lives > 0 {
+                self.lose_life(1.0);
+            }
+        }
+        if self.phase == Phase::Playing {
+            self.banner = "TIME UP  THE BOSS ESCAPES".to_string();
+            self.banner_t = 2.0;
+            self.pending_clear = true;
+            self.clear_t = 2.2;
+            self.clear_typed();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn begin_wave_for_test(&mut self, wave: u32) {
+        self.wave = wave;
+        self.begin_wave();
     }
 
     #[cfg(test)]
@@ -1350,6 +1590,7 @@ impl Game {
     /// Enter the shop. `pay_interest` is false when resuming a saved shop.
     fn open_shop(&mut self, pay_interest: bool) {
         self.phase = Phase::Shop;
+        self.boss = None;
         self.clear_typed();
         self.shop_note.clear();
         if pay_interest && self.upgrades.has(Upgrade::Interest) {
@@ -1856,6 +2097,13 @@ impl Game {
         self.banner_t = (self.banner_t - dt).max(0.0);
         self.gem_flash = (self.gem_flash - dt).max(0.0);
         self.brake = (self.brake - dt).max(0.0);
+        if let Some(b) = self.boss.as_mut() {
+            b.age += dt;
+            b.strike = (b.strike - dt).max(0.0);
+            if !b.active() {
+                b.outcome_t += dt;
+            }
+        }
         if self.combo > 0 && self.phase == Phase::Playing {
             self.combo_left -= dt;
             if self.combo_left <= 0.0 {
@@ -2371,6 +2619,200 @@ mod tests {
         type_word(&mut g, "planet");
         assert!(g.rocks.iter().all(|r| !r.live) || g.rocks.is_empty());
         assert_eq!(g.kills, 23);
+    }
+
+    /// A game on its first boss wave with the intro over.
+    fn boss_fight() -> Game {
+        let mut g = playing();
+        g.begin_wave_for_test(5);
+        while g.boss.as_ref().is_some_and(|b| b.intro > 0.0) {
+            g.update(0.05);
+        }
+        g
+    }
+
+    /// The first letter that is not the next letter of the current word.
+    fn wrong_key(g: &Game) -> char {
+        let next = g
+            .target_word()
+            .unwrap()
+            .chars()
+            .nth(g.buffer.len())
+            .unwrap();
+        if next == 'z' {
+            'q'
+        } else {
+            'z'
+        }
+    }
+
+    #[test]
+    fn boss_math_scales_to_the_wpm_cap() {
+        assert!(boss::is_boss_wave(5) && boss::is_boss_wave(10));
+        assert!(!boss::is_boss_wave(0) && !boss::is_boss_wave(4));
+        let wpm: Vec<u32> = (1..=7).map(boss::target_wpm).collect();
+        assert_eq!(wpm, [40, 60, 80, 100, 120, 120, 120]);
+        let mut k = 0;
+        let b = Boss::new(2, |n| {
+            k += 7;
+            k % n
+        });
+        let pace = b.chars_total as f32 / 5.0 / (b.limit / 60.0);
+        assert!((pace - 60.0).abs() < 0.01, "the clock matches the pace");
+        assert!(b.words.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn a_boss_wave_is_a_typing_test_not_a_field_of_hazards() {
+        let mut g = playing();
+        g.begin_wave_for_test(5);
+        assert!(g.boss.is_some());
+        assert!(g.rocks.is_empty());
+        assert_eq!(g.target_word(), None, "no word during the warning");
+        g.type_char('a');
+        assert!(g.buffer.is_empty(), "keys do nothing yet");
+        let before = g.lives;
+        g.type_char('z');
+        assert_eq!(g.lives, before, "no strike during the intro");
+        for _ in 0..70 {
+            g.update(0.05);
+        }
+        assert!(g.target_word().is_some());
+        for _ in 0..60 {
+            g.update(0.05);
+        }
+        assert!(g.rocks.is_empty(), "nothing spawns during a boss");
+    }
+
+    #[test]
+    fn a_wrong_key_makes_the_boss_strike_once_per_grace_period() {
+        let mut g = boss_fight();
+        let word = g.target_word().unwrap().to_string();
+        g.type_char(word.chars().next().unwrap());
+        let bad = wrong_key(&g);
+        let hearts = g.lives;
+        g.type_char(bad);
+        assert_eq!(g.lives, hearts - 1);
+        assert_eq!(g.buffer.len(), 1, "correct letters survive a strike");
+        g.type_char(bad);
+        assert_eq!(g.lives, hearts - 1, "grace period after a strike");
+        g.backspace();
+        assert_eq!(g.buffer.len(), 1, "no backspace in a boss fight");
+    }
+
+    #[test]
+    fn a_ward_blocks_a_strike_and_clean_slate_forgives_one() {
+        let mut g = boss_fight();
+        g.shield = 1;
+        let bad = wrong_key(&g);
+        let hearts = g.lives;
+        g.type_char(bad);
+        assert_eq!((g.lives, g.shield), (hearts, 0));
+
+        let mut h = playing();
+        h.upgrades.set(Upgrade::CleanSlate, 1);
+        h.begin_wave_for_test(5);
+        for _ in 0..70 {
+            h.update(0.05);
+        }
+        let bad = wrong_key(&h);
+        h.type_char(bad);
+        assert_eq!(h.lives, BASE_HEARTS);
+        h.type_char(bad);
+        assert_eq!(h.lives, BASE_HEARTS - 1, "only the first slip is free");
+    }
+
+    #[test]
+    fn finishing_the_passage_beats_the_boss_and_opens_the_shop() {
+        let mut g = boss_fight();
+        g.lives = 2;
+        let before = g.crystals;
+        let words = g.boss.as_ref().unwrap().words.clone();
+        for word in words {
+            assert_eq!(g.target_word(), Some(word));
+            for c in word.chars() {
+                g.type_char(c);
+            }
+        }
+        let b = g.boss.as_ref().unwrap();
+        assert_eq!(b.outcome, Some(true));
+        assert_eq!(b.progress(), 1.0);
+        assert_eq!(g.crystals, before + 20);
+        assert_eq!(g.lives, 3, "a win heals one heart");
+        assert!(g.banner.contains("BOSS DOWN"));
+        for _ in 0..80 {
+            g.update(0.05);
+        }
+        assert_eq!(g.phase, Phase::Shop);
+        assert!(g.boss.is_none());
+        assert_eq!(g.wave, 6);
+    }
+
+    #[test]
+    fn running_out_of_time_costs_hearts_but_not_the_run() {
+        let mut g = boss_fight();
+        let limit = g.boss.as_ref().unwrap().limit;
+        for _ in 0..((limit / 0.05) as usize + 5) {
+            g.update(0.05);
+        }
+        assert_eq!(g.boss.as_ref().unwrap().outcome, Some(false));
+        assert_eq!(g.lives, BASE_HEARTS - boss::TIMEOUT_HEARTS);
+        for _ in 0..80 {
+            g.update(0.05);
+        }
+        assert_eq!(g.phase, Phase::Shop);
+        assert_eq!(g.crystals, 0, "no reward for losing");
+
+        let mut dead = boss_fight();
+        dead.lives = 1;
+        let limit = dead.boss.as_ref().unwrap().limit;
+        for _ in 0..((limit / 0.05) as usize + 5) {
+            dead.update(0.05);
+        }
+        assert_ne!(dead.phase, Phase::Playing, "the last heart still ends it");
+    }
+
+    #[test]
+    fn the_shark_swims_laps_on_screen_and_the_ship_tracks_it() {
+        let mut g = playing();
+        g.theme = Theme::Underwater;
+        g.begin_wave_for_test(5);
+        let home = g.boss_home();
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let mut headings = Vec::new();
+        for _ in 0..400 {
+            g.update(0.05);
+            let (x, _) = g.boss_pos();
+            lo = lo.min(x);
+            hi = hi.max(x);
+            headings.push(boss::heading(g.boss.as_ref().unwrap().age));
+        }
+        assert!(lo < home.0 - 5.0 && hi > home.0 + 5.0, "{lo}..{hi}");
+        assert!(lo > 0.0 && hi < g.play_w, "{lo}..{hi}");
+        assert!(headings.iter().any(|&h| h > 0.9) && headings.iter().any(|&h| h < -0.9));
+        // The ship keeps its nose on the shark as it swims.
+        let (sx, sy) = g.ship_pos();
+        let (bx, by) = g.boss_pos();
+        let want = (bx - sx).atan2(-(by - sy));
+        assert!(angle_delta(g.angle, want).abs() < 0.2);
+    }
+
+    #[test]
+    fn the_boss_clock_stops_while_paused_and_typing_sets_the_pace() {
+        let mut g = boss_fight();
+        let t = g.boss.as_ref().unwrap().elapsed;
+        g.phase = Phase::Paused;
+        g.update(0.0);
+        assert_eq!(g.boss.as_ref().unwrap().elapsed, t);
+        g.phase = Phase::Playing;
+        let word = g.target_word().unwrap().to_string();
+        for c in word.chars() {
+            g.type_char(c);
+        }
+        for _ in 0..25 {
+            g.update(0.05);
+        }
+        assert!(g.boss.as_ref().unwrap().live_wpm() > 0);
     }
 
     /// A kill target plus short and long bystanders, for Multishot tests.

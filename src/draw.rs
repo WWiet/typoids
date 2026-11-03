@@ -2,9 +2,10 @@
 //! braille line art; words sit on top in plain cells so they stay readable.
 
 use crate::game::{metrics, rotate, Effect, Game, Metrics, Phase, Rock, Theme};
-use crate::upgrades::Rarity;
+use crate::upgrades::{Rarity, Upgrade};
 
 mod bigfont;
+mod bossfight;
 mod ships;
 mod stage;
 use ratatui::layout::Rect;
@@ -364,6 +365,109 @@ fn ink_path(
     }
 }
 
+/// A fixed highlight arc, so the light stays put while a hazard spins.
+fn highlight(radius: f32) -> Vec<(f32, f32)> {
+    (0..5)
+        .map(|i| {
+            let a = -2.5 + i as f32 * 0.2;
+            (a.cos() * radius, a.sin() * radius)
+        })
+        .collect()
+}
+
+/// A craggy asteroid: a jagged outline, two pits, and a highlight.
+fn draw_asteroid(
+    ink: &mut InkLayer,
+    to_px: &impl Fn(f32, f32) -> (f32, f32),
+    rock: &Rock,
+    style: (u8, Color),
+    pal: &Palette,
+) {
+    let (pri, col) = style;
+    // Push alternate corners in and out so it reads as broken rock, not a pebble.
+    const CRAG: [f32; 5] = [1.12, 0.78, 1.0, 0.86, 1.2];
+    let outline: Vec<(f32, f32)> = rock
+        .shape
+        .iter()
+        .enumerate()
+        .map(|(i, (x, y))| {
+            let k = CRAG[(i + rock.id as usize) % CRAG.len()] / rock.radius;
+            (x * k, y * k)
+        })
+        .collect();
+    ink_path(ink, to_px, (rock, rock.rot), &outline, true, style);
+    // Pits turn with the rock.
+    for (px, py) in [(-0.28, 0.14), (0.3, -0.26)] {
+        let (ox, oy) = rotate(px * rock.radius, py * rock.radius, rock.rot);
+        let (x, y) = to_px(rock.x + ox * CELL_X, rock.y + oy * CELL_Y);
+        ink.dot(x, y, pri, fade(col, 0.6));
+    }
+    ink_path(
+        ink,
+        to_px,
+        (rock, 0.0),
+        &highlight(0.7),
+        false,
+        (pri + 2, fade(pal.hot, 0.5)),
+    );
+}
+
+/// A naval mine: a round shell, eight horns with bright tips, and a short
+/// chain trailing behind its drift.
+fn draw_mine(
+    ink: &mut InkLayer,
+    to_px: &impl Fn(f32, f32) -> (f32, f32),
+    rock: &Rock,
+    style: (u8, Color),
+    pal: &Palette,
+) {
+    let (pri, _) = style;
+    ink_path(
+        ink,
+        to_px,
+        (rock, 0.0),
+        &ellipse(0.0, 0.0, 0.78, 0.78, 20),
+        true,
+        style,
+    );
+    // Horns: a short stud with a bright tip.
+    for i in 0..8 {
+        let a = rock.rot + i as f32 / 8.0 * TAU;
+        let (c, s) = (a.cos(), a.sin());
+        ink_path(
+            ink,
+            to_px,
+            (rock, 0.0),
+            &[(c * 0.78, s * 0.78), (c * 1.02, s * 1.02)],
+            false,
+            style,
+        );
+        let (ox, oy) = ((c * 1.1) * rock.radius, (s * 1.1) * rock.radius);
+        let (x, y) = to_px(rock.x + ox * CELL_X, rock.y + oy * CELL_Y);
+        ink.dot(x, y, pri + 1, pal.hot);
+    }
+    // Chain links trail opposite the direction of travel.
+    let speed = (rock.vx * rock.vx + rock.vy * rock.vy).sqrt().max(0.01);
+    // Travel direction in cells, mapped back into the squashed local frame.
+    let (bx, by) = (-rock.vx / speed / CELL_X, -rock.vy / speed / CELL_Y);
+    let norm = (bx * bx + by * by).sqrt().max(0.01);
+    let (bx, by) = (bx / norm, by / norm);
+    let mut prev = (bx * 1.25, by * 1.25);
+    for k in 1..=3 {
+        let d = 1.25 + k as f32 * 0.3;
+        let next = (bx * d, by * d);
+        ink_path(
+            ink,
+            to_px,
+            (rock, 0.0),
+            &[prev, next],
+            false,
+            (pri, fade(pal.dim, 0.9)),
+        );
+        prev = next;
+    }
+}
+
 /// A coconut: round, with a hairy husk, a highlight, and three pores.
 fn draw_coconut(
     ink: &mut InkLayer,
@@ -397,17 +501,11 @@ fn draw_coconut(
         );
     }
     // Fixed highlight, so the light stays put while the nut spins.
-    let arc: Vec<(f32, f32)> = (0..5)
-        .map(|i| {
-            let a = -2.5 + i as f32 * 0.2;
-            (a.cos() * 0.66, a.sin() * 0.66)
-        })
-        .collect();
     ink_path(
         ink,
         to_px,
         (rock, 0.0),
-        &arc,
+        &highlight(0.66),
         false,
         (pri + 2, fade(pal.hot, 0.55)),
     );
@@ -497,6 +595,41 @@ fn projectile_colors(theme: Theme, pal: &Palette) -> (Color, Color) {
     match theme {
         Theme::Space | Theme::Underwater => (pal.hot, pal.accent),
         Theme::Jungle | Theme::CatCafe => (pal.amber, pal.amber),
+    }
+}
+
+/// Fast movers that would hop whole cells as glyphs: crystals (a small
+/// diamond that glints) and exhaust dots. In braille they glide.
+fn draw_motes(
+    ink: &mut InkLayer,
+    game: &Game,
+    pal: &Palette,
+    to_px: impl Fn(f32, f32) -> (f32, f32),
+) {
+    for gem in &game.gems {
+        let (x, y) = to_px(gem.x, gem.y);
+        let glint = (game.time * 9.0 + gem.x).sin() > 0.5;
+        let col = if glint { pal.hot } else { pal.gem };
+        let tips = [(x, y - 2.0), (x + 1.0, y), (x, y + 2.0), (x - 1.0, y)];
+        for i in 0..4 {
+            let (a, b) = (tips[i], tips[(i + 1) % 4]);
+            ink.line(a.0, a.1, b.0, b.1, 4, col);
+        }
+    }
+    for effect in &game.effects {
+        if let Effect::Spark {
+            x,
+            y,
+            glyph: '·',
+            life,
+            max,
+            ..
+        } = effect
+        {
+            let (px, py) = to_px(*x, *y);
+            let k = if *max > 0.0 { life / max } else { 0.0 };
+            ink.dot(px, py, 3, if k > 0.45 { pal.hot } else { pal.accent });
+        }
     }
 }
 
@@ -650,37 +783,12 @@ pub fn draw(frame: &mut Frame, game: &Game) {
         };
         let pri = if aimed { 2 } else { 1 };
 
-        if game.theme == Theme::Underwater {
-            // Six short horns.
-            for i in 0..6 {
-                let a = rock.rot + i as f32 / 6.0 * std::f32::consts::TAU;
-                let (x0, y0) = to_px(
-                    rock.x + a.cos() * rock.radius * 0.95,
-                    rock.y + a.sin() * rock.radius * 0.95,
-                );
-                let (x1, y1) = to_px(
-                    rock.x + a.cos() * rock.radius * 1.25,
-                    rock.y + a.sin() * rock.radius * 1.25,
-                );
-                ink.line(x0, y0, x1, y1, pri, col);
-            }
-        }
-
+        let style = (pri, col);
         match game.theme {
-            Theme::Jungle => draw_coconut(&mut ink, &to_px, rock, (pri, col), pal),
-            Theme::CatCafe => draw_cup(&mut ink, &to_px, rock, (pri, col), (pal, game.time), aimed),
-            Theme::Space | Theme::Underwater => {
-                let n = rock.shape.len();
-                for i in 0..n {
-                    let (ax, ay) = rock.shape[i];
-                    let (bx, by) = rock.shape[(i + 1) % n];
-                    let (ax, ay) = rotate(ax, ay, rock.rot);
-                    let (bx, by) = rotate(bx, by, rock.rot);
-                    let (x0, y0) = to_px(rock.x + ax, rock.y + ay);
-                    let (x1, y1) = to_px(rock.x + bx, rock.y + by);
-                    ink.line(x0, y0, x1, y1, pri, col);
-                }
-            }
+            Theme::Space => draw_asteroid(&mut ink, &to_px, rock, style, pal),
+            Theme::Underwater => draw_mine(&mut ink, &to_px, rock, style, pal),
+            Theme::Jungle => draw_coconut(&mut ink, &to_px, rock, style, pal),
+            Theme::CatCafe => draw_cup(&mut ink, &to_px, rock, style, (pal, game.time), aimed),
         }
     }
 
@@ -688,6 +796,8 @@ pub fn draw(frame: &mut Frame, game: &Game) {
     if !blink_off && game.phase != Phase::Shop {
         ships::draw_ship(&mut ink, game, pal, to_px);
     }
+    bossfight::draw_boss(&mut ink, game, pal, to_px);
+    draw_motes(&mut ink, game, pal, to_px);
 
     for y in 0..ink.h {
         for x in 0..ink.w {
@@ -714,25 +824,11 @@ pub fn draw(frame: &mut Frame, game: &Game) {
                 pal,
                 (rock.x + shx, rock.y + shy),
                 // Squashed hazard art sits closer to its center.
-                match game.theme {
-                    Theme::Jungle | Theme::CatCafe => rock.radius * 0.75,
-                    _ => rock.radius,
-                },
+                rock.radius * 0.75,
                 &rock.word,
                 oy,
             );
         }
-    }
-
-    for gem in &game.gems {
-        let glint = ((game.time * 9.0 + gem.x).sin() > 0.5) as usize;
-        put(
-            buf,
-            (gem.x + shx).round() as i32,
-            (gem.y + shy).round() as i32 + oy,
-            ["◆", "◇"][glint],
-            style(pal.gem).add_modifier(Modifier::BOLD),
-        );
     }
 
     for effect in &game.effects {
@@ -745,6 +841,10 @@ pub fn draw(frame: &mut Frame, game: &Game) {
             ..
         } = effect
         {
+            // Plain dots glide in braille instead (see `draw_motes`).
+            if *glyph == '·' {
+                continue;
+            }
             let fade = if *max > 0.0 { *life / *max } else { 0.0 };
             let col = if fade > 0.45 { pal.hot } else { pal.accent };
             put(
@@ -806,6 +906,7 @@ pub fn draw(frame: &mut Frame, game: &Game) {
     if matches!(game.phase, Phase::Playing | Phase::Paused | Phase::Dying) {
         stage::draw_stage(buf, game, pal, m);
     }
+    bossfight::draw_boss_ui(buf, game, pal, m);
     draw_dock(buf, game, pal, m);
     // Menus and the shop use the stage rows too; only play needs them.
     let menu = Metrics {
@@ -1038,7 +1139,10 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, m: M
                 buf,
                 2,
                 y1,
-                "h l move  ·  enter select  ·  1 2 3 buy  ·  r reroll  ·  space go",
+                &format!(
+                    "h l move  ·  enter select  ·  1-{} buy  ·  r reroll  ·  space go",
+                    game.shop_slots()
+                ),
                 style(pal.dim),
             );
             put(buf, 2, y2, &game.shop_note, style(pal.amber));
@@ -1074,7 +1178,17 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, m: M
             let nmatch = game.matches();
             if m.stage_h > 0 {
                 // The stage shows the word; the dock only reports problems.
-                if game.miss > 0.08 && game.buffer.is_empty() {
+                if game.boss.is_some() {
+                    if game.miss > 0.08 {
+                        put(
+                            buf,
+                            2,
+                            y1,
+                            "wrong key: the boss strikes!",
+                            style(pal.danger).add_modifier(bold),
+                        );
+                    }
+                } else if game.miss > 0.08 && game.buffer.is_empty() {
                     put(
                         buf,
                         2,
@@ -1088,7 +1202,14 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, m: M
             } else {
                 draw_input_line(buf, game, pal, dock_y);
             }
-            put(buf, 2, y2, &play_hint(game, word, nmatch), style(pal.dim));
+            let hint = match &game.boss {
+                Some(b) if b.intro > 0.0 => {
+                    "boss incoming: type each word as it appears".to_string()
+                }
+                Some(_) => "finish every word before the clock runs out".to_string(),
+                None => play_hint(game, word, nmatch),
+            };
+            put(buf, 2, y2, &hint, style(pal.dim));
         }
     }
 }
@@ -1550,8 +1671,20 @@ fn draw_shop(
     let card_w = ((w as i32 - 4 - gap * (cols - 1)) / cols).clamp(14, 24);
     let total = card_w * cols + gap * (cols - 1);
     let left = (w as i32 - total) / 2;
-    let card_h = (m.play_h as i32 - 7).clamp(7, 10);
-    let block_h = card_h + 6;
+    // Installed upgrades get a compact table under the buttons; the cards
+    // give up height when the table needs it.
+    let held: Vec<(Upgrade, u8)> = game.upgrades.held().collect();
+    let table_cols = ((w as i32 - 4) / TABLE_COL_W).max(1) as usize;
+    // Cards keep room for a three-line description; the table takes the rest
+    // (a header row, then as many rows as fit).
+    let spare = (m.play_h as i32 - (9 + 6)).max(1);
+    let table_rows = if held.is_empty() {
+        0
+    } else {
+        (held.len().div_ceil(table_cols) as i32 + 1).min(spare)
+    };
+    let card_h = (m.play_h as i32 - 7 - table_rows).clamp(7, 10);
+    let block_h = card_h + 6 + table_rows;
     let top = m.origin_y as i32 + (m.play_h as i32 - block_h).max(0) / 2;
 
     // Heading: shop name, wave, and the purse.
@@ -1737,27 +1870,60 @@ fn draw_shop(
         bx += label.chars().count() as i32 + btn_gap;
     }
 
-    // What the run holds so far.
-    let owned: Vec<String> = game
-        .upgrades
-        .held()
-        .map(|(up, level)| up.tier(level).name.to_string())
-        .collect();
-    let line = if owned.is_empty() {
-        "nothing installed yet".to_string()
+    draw_installed(buf, pal, (left, by + 2, total, table_rows - 1), &held);
+}
+
+/// Width of one column in the installed table: a 12-letter name, a gap, pips.
+const TABLE_COL_W: i32 = 22;
+
+/// The run's upgrades as a table: one cell per line showing its newest card
+/// and level pips. Rows that do not fit above the dock are summarized.
+fn draw_installed(
+    buf: &mut ratatui::buffer::Buffer,
+    pal: &Palette,
+    area: (i32, i32, i32, i32),
+    held: &[(Upgrade, u8)],
+) {
+    let (left, top, width, rows) = area;
+    if held.is_empty() {
+        put_centered(
+            buf,
+            0,
+            buf.area.width as i32,
+            top,
+            "nothing installed yet",
+            style(pal.faint),
+        );
+        return;
+    }
+    let cols = ((width / TABLE_COL_W).max(1) as usize).min(held.len());
+    let table_w = cols as i32 * TABLE_COL_W;
+    let x0 = left + (width - table_w).max(0) / 2;
+    let shown = (rows.max(0) as usize * cols).min(held.len());
+    let more = if shown < held.len() {
+        format!("  (+{} more)", held.len() - shown)
     } else {
-        owned.join("  ·  ")
+        String::new()
     };
-    let room = (w as usize).saturating_sub(4);
-    let line: String = if line.chars().count() > room {
-        line.chars()
-            .take(room.saturating_sub(1))
-            .chain(['…'])
-            .collect()
-    } else {
-        line
-    };
-    put_centered(buf, 0, w as i32, by + 2, &line, style(pal.faint));
+    put(
+        buf,
+        x0,
+        top,
+        &format!("INSTALLED {}{more}", held.len()),
+        style(pal.dim).add_modifier(Modifier::BOLD),
+    );
+    for (i, &(up, level)) in held.iter().take(shown).enumerate() {
+        let x = x0 + (i % cols) as i32 * TABLE_COL_W;
+        let y = top + 1 + (i / cols) as i32;
+        let tier = up.tier(level);
+        put(buf, x, y, tier.name, style(rarity_color(tier.rarity, pal)));
+        if up.max() > 1 {
+            let pips: String = (0..up.max())
+                .map(|n| if n < level { '●' } else { '○' })
+                .collect();
+            put(buf, x + 13, y, &pips, style(pal.dim));
+        }
+    }
 }
 
 fn put_centered(
@@ -2148,6 +2314,72 @@ mod tests {
             5,
             "{top}"
         );
+    }
+
+    #[test]
+    fn installed_upgrades_form_a_compact_table() {
+        use crate::upgrades::Upgrade;
+        let mut game = locked_rock_game(Theme::Space, "comet");
+        game.rocks.clear();
+        for (up, level) in [
+            (Upgrade::Prospector, 2),
+            (Upgrade::SlowTide, 3),
+            (Upgrade::Multishot, 1),
+            (Upgrade::Haggler, 1),
+            (Upgrade::Focus, 2),
+        ] {
+            game.upgrades.set(up, level);
+        }
+        game.open_shop_for_test();
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("INSTALLED 5"), "{screen}");
+        assert!(
+            screen.contains("GOLD PAN"),
+            "newest card of the line\n{screen}"
+        );
+        assert!(screen.contains("STILL WATER"), "{screen}");
+        assert!(screen.contains("●●○○○"), "level pips\n{screen}");
+        assert!(screen.contains("HAGGLER"), "{screen}");
+        // Cards still draw above it.
+        assert!(screen.contains("NEXT WAVE"), "{screen}");
+    }
+
+    #[test]
+    fn crystals_glide_in_braille_and_the_underwater_boss_is_a_shark() {
+        let mut game = locked_rock_game(Theme::Underwater, "comet");
+        game.gems.push(crate::game::Gem::resting(20.3, 6.6));
+        let screen = render(&game, 80, 24);
+        let field: String = screen.lines().skip(1).collect();
+        assert!(
+            !field.contains('◆'),
+            "gems are braille, not glyphs\n{screen}"
+        );
+
+        game.begin_wave_for_test(5);
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("THE GREAT WHITE"), "{screen}");
+    }
+
+    #[test]
+    fn a_boss_wave_shows_the_boss_clock_and_passage() {
+        for theme in Theme::ALL {
+            let mut game = locked_rock_game(theme, "comet");
+            game.begin_wave_for_test(5);
+            let intro = render(&game, 80, 24);
+            assert!(intro.contains("BOSS FIGHT"), "{intro}");
+            assert!(intro.contains("40 WPM"), "{intro}");
+            assert!(intro.contains("starting in"), "{intro}");
+            for _ in 0..70 {
+                game.update(0.05);
+            }
+            let fight = render(&game, 80, 24);
+            assert!(fight.contains("HP"), "{fight}");
+            assert!(fight.contains("TIME"), "{fight}");
+            assert!(fight.contains("/ 40 WPM"), "{fight}");
+            let word = game.target_word().unwrap().to_string();
+            assert!(fight.contains(&word), "passage shows {word}\n{fight}");
+            assert!(fight.contains("finish every word"), "{fight}");
+        }
     }
 
     #[test]

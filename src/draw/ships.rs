@@ -9,7 +9,7 @@ use super::{ellipse, fade, InkLayer, Palette, CELL_X, CELL_Y};
 use crate::game::{rotate, Game, Theme};
 use std::f32::consts::TAU;
 
-type Pt = (f32, f32);
+pub(super) type Pt = (f32, f32);
 
 /// Draw the ship for the current theme.
 pub fn draw_ship(
@@ -40,12 +40,12 @@ pub fn draw_ship(
     }
 }
 
-struct Craft<'a, F> {
-    ink: &'a mut InkLayer,
-    to_px: F,
-    at: Pt,
-    angle: f32,
-    scale: f32,
+pub(super) struct Craft<'a, F> {
+    pub(super) ink: &'a mut InkLayer,
+    pub(super) to_px: F,
+    pub(super) at: Pt,
+    pub(super) angle: f32,
+    pub(super) scale: f32,
 }
 
 impl<F: Fn(f32, f32) -> (f32, f32)> Craft<'_, F> {
@@ -54,29 +54,29 @@ impl<F: Fn(f32, f32) -> (f32, f32)> Craft<'_, F> {
         (self.to_px)(self.at.0 + x * CELL_X, self.at.1 + y * CELL_Y)
     }
 
-    fn seg(&mut self, a: Pt, b: Pt, pri: u8, col: ratatui::style::Color) {
+    pub(super) fn seg(&mut self, a: Pt, b: Pt, pri: u8, col: ratatui::style::Color) {
         let (a, b) = (self.pt(a), self.pt(b));
         self.ink.line(a.0, a.1, b.0, b.1, pri, col);
     }
 
-    fn dot(&mut self, p: Pt, pri: u8, col: ratatui::style::Color) {
+    pub(super) fn dot(&mut self, p: Pt, pri: u8, col: ratatui::style::Color) {
         let p = self.pt(p);
         self.ink.dot(p.0, p.1, pri, col);
     }
 
-    fn path(&mut self, pts: &[Pt], closed: bool, pri: u8, col: ratatui::style::Color) {
+    pub(super) fn path(&mut self, pts: &[Pt], closed: bool, pri: u8, col: ratatui::style::Color) {
         let last = if closed { pts.len() } else { pts.len() - 1 };
         for i in 0..last {
             self.seg(pts[i], pts[(i + 1) % pts.len()], pri, col);
         }
     }
 
-    fn ring(&mut self, c: Pt, rx: f32, ry: f32, pri: u8, col: ratatui::style::Color) {
+    pub(super) fn ring(&mut self, c: Pt, rx: f32, ry: f32, pri: u8, col: ratatui::style::Color) {
         self.path(&ellipse(c.0, c.1, rx, ry, 16), true, pri, col);
     }
 
     /// Both halves of a symmetric detail: `pts` and its mirror across x = 0.
-    fn pair(&mut self, pts: &[Pt], closed: bool, pri: u8, col: ratatui::style::Color) {
+    pub(super) fn pair(&mut self, pts: &[Pt], closed: bool, pri: u8, col: ratatui::style::Color) {
         self.path(pts, closed, pri, col);
         let mirrored: Vec<Pt> = pts.iter().map(|p| (-p.0, p.1)).collect();
         self.path(&mirrored, closed, pri, col);

@@ -38,9 +38,11 @@ There is no separate lint config and no CI; `-D warnings` is the standard.
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Terminal setup, event loop, key handling per phase. |
+| `src/main.rs` | Terminal setup, frame-paced event loop, key handling per phase. |
 | `src/game.rs` | Simulation: state machine, hazards, typing buffer, scoring, effects, RNG, theme list, tests. |
 | `src/draw.rs` | All rendering: palettes, background, braille ink layer, ships, hazards, effects, HUD, menus, render tests. |
+| `src/boss.rs` | Boss-wave rules: cadence, WPM targets, passage and clock (`Boss`). Data and math only. |
+| `src/draw/bossfight.rs` | The boss art, its HP/clock/pace bar, and the passage panel. |
 | `src/draw/ships.rs` | The four player craft (`Craft` helper plus one function per theme). |
 | `src/draw/stage.rs` | The typing stage: big pixel letters along the bottom, with slide, assemble and shatter animations. |
 | `src/draw/bigfont.rs` | 5x7 capital-letter pixel font for the stage. Data only. |
@@ -128,6 +130,43 @@ in a three-card shop that opens after every cleared wave (`Phase::Shop`).
   `main.rs` calls `enable_persistence()`, so `persist` is off in `Game::new`.
   Test save logic through `snapshot`/`load_run` and `save::encode`/`decode`.
 
+## Boss waves
+
+Every fifth wave (`boss::EVERY`) replaces the hazard field with a timed typing
+test. `begin_wave` calls `start_boss`, which sets `Game::boss`; while it is
+`Some`, `update_play` runs `update_boss` instead of spawning hazards.
+
+- **Rules.** The boss demands `target_wpm(tier)`: 40, 60, 80, 100, then 120
+  forever. The passage is `passage_len(tier)` words (up to 40) and the clock is
+  `chars / 5 / wpm * 60` seconds, counting a space after every word as typing
+  tests do. A three-second intro (`INTRO`) lets the player read; keys do nothing
+  until it ends and the clock starts afterwards.
+- **Typing.** `type_char` routes to `boss_type`. The buffer only ever holds the
+  correct start of the current word and finishing the word advances at once (no
+  space key). `target_word()` returns the current word, so the stage draws it
+  big with the normal slide and assemble animations. Backspace is disabled.
+- **Damage.** A wrong key calls `boss_miss`: Clean Slate forgives the first
+  slip each wave, a Ward absorbs one, otherwise `lose_life(0.7)` costs a heart
+  with a short grace period so a burst of slips is one hit. The correct letters
+  stay in the buffer. `lose_life` is shared with hazard collisions.
+- **Outcomes.** Finishing the passage (`boss_win`) pays `12 + 8 * tier`
+  crystals, score by tier and pace, and heals one heart. Running out of time
+  (`boss_timeout`) costs `TIMEOUT_HEARTS` (2) hearts and pays nothing; if that
+  empties the hearts the normal death sequence runs. Both reuse the
+  `pending_clear` path into the shop, which clears `Game::boss`.
+- **Layout.** With a boss the ship sits low (`ship_center`), the boss rests at
+  `boss_home` and is drawn at `boss_pos` (home plus `boss::drift`, driven by
+  `Boss::age`, so lasers and aiming follow it), and the passage panel is laid
+  out from `boss_home` so it never jitters.
+- **Art.** Space, Jungle and Cat Cafe bosses are a head plus an accessory
+  (`draw_head`); Underwater is a side-on great white (`draw_shark`) that swims
+  laps, faces its heading (`boss::heading`) and opens its jaw on a strike. A
+  strike is one smooth lunge over `boss::STRIKE`, never a per-frame jitter. The status line (name,
+  HP, clock that turns red when behind pace, live WPM) is play row 0.
+- **Tuning.** Cadence, pace, passage length, pay and the timeout penalty are
+  constants and small functions in `boss.rs` and the `boss_*` methods in
+  `game.rs`. Add a test when you change one.
+
 ## Rendering rules
 
 - `draw::draw(frame, game)` paints the background first, then returns early with
@@ -184,7 +223,7 @@ the things the player acts on carry color. Hold to this when adding visuals.
   the one-line input (`draw_input_line`).
 - **Shop cards.** `draw_shop` lays out three framed cards by rarity: single
   line for common, heavy for the selected card, double line and `★` for rare.
-  Prices use `pal.gem`, or `pal.danger` when unaffordable. Wrap descriptions
+  The run's upgrades sit under the buttons as a compact table (`draw_installed`: newest card per line plus level pips, capped so cards keep three description lines). Prices use `pal.gem`, or `pal.danger` when unaffordable. Wrap descriptions
   with `wrap`; never let text spill past a card's inner width.
 - **Words are chips.** `draw_label` paints every word on a `pal.chip`
   background with one padding cell on each side. The locked word gets a warmer
@@ -195,15 +234,19 @@ the things the player acts on carry color. Hold to this when adding visuals.
   Space and Underwater explosions are `Game::burst` (one ring, six shards).
   Jungle and Cat Cafe hazards spill instead (`Game::pour`: `Effect::Drop`
   droplets that fall under `DROP_GRAVITY`, plus a lingering `Effect::Puddle`
-  colored `pal.liquid`). Exhaust is one dim `·`.
+  colored `pal.liquid`). Exhaust is one braille dot. Anything fast that
+  moves (crystals, exhaust, hit dots) goes in the ink layer via `draw_motes`
+  so it glides by sub-pixel; whole-cell glyphs only for slow scenery and text.
   Do not reintroduce per-theme spark confetti, letter bursts, lock rings, or
   blinking fuses; if a theme needs character, put it in the ship, the hazard
   silhouette, the palette, or the ring's squash/wobble.
-- **Hazards are an outline plus at most one signature mark** (mines: six short
-  horns; coconuts: husk fibers and a pore face; cups: rim, handle, and saucer,
-  with steam only while locked). Jungle and Cat Cafe hazards are drawn by
-  `draw_coconut` / `draw_cup` from local-frame points via `ink_path`, not from
-  `Rock.shape` (which only drives the Space/Underwater polygons).
+- **Hazards are an outline plus at most one signature mark** (asteroids: jagged
+  outline and two pits; mines: a round shell, eight horns with bright tips, and
+  a chain trailing behind the drift; coconuts: husk fibers and a pore face;
+  cups: rim, handle, and saucer, with steam only while locked). Every theme has
+  its own `draw_asteroid` / `draw_mine` / `draw_coconut` / `draw_cup`, all drawn
+  from local-frame points via `ink_path`. `Rock.shape` only feeds the asteroid
+  outline.
 - **Mind the cell aspect.** A cell is about twice as tall as wide, so a circle
   in world units draws as a tall oval. Hazard art goes through `ink_path`,
   which squashes local y (`CELL_Y`/`CELL_X`) so shapes look round. Reuse it for
@@ -285,9 +328,16 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
   helper and assert on the resulting text (e.g. menu labels and hint copy).
   Add a render assertion when you add player-visible strings or theme visuals.
 - Every behavior change should add or update a focused test. Keep the suite
-  green; currently 59 tests.
+  green; currently 70 tests.
 
 ## Gotchas
+
+- Frame pacing lives in `main.rs`: update, then `present` (a synchronized
+  update, DEC mode 2026, so frames never tear), then wait for input until the
+  next `FRAME` deadline (120 fps). A keypress cuts the wait short so typing
+  shows at once. A frame costs well under 1 ms; keep it that way, since the
+  whole budget is 8 ms. Do not go back to drawing before updating or to a
+  fixed sleep after drawing; both read as lag.
 
 - ratatui only sends cells that changed. A terminal that wipes cells itself
   (fullscreen toggles resize in several quick steps) leaves stale blanks that
