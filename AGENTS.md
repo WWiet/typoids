@@ -41,6 +41,9 @@ There is no separate lint config and no CI; `-D warnings` is the standard.
 | `src/main.rs` | Terminal setup, event loop, key handling per phase. |
 | `src/game.rs` | Simulation: state machine, hazards, typing buffer, scoring, effects, RNG, theme list, tests. |
 | `src/draw.rs` | All rendering: palettes, background, braille ink layer, ships, hazards, effects, HUD, menus, render tests. |
+| `src/draw/ships.rs` | The four player craft (`Craft` helper plus one function per theme). |
+| `src/draw/stage.rs` | The typing stage: big pixel letters along the bottom, with slide, assemble and shatter animations. |
+| `src/draw/bigfont.rs` | 5x7 capital-letter pixel font for the stage. Data only. |
 | `src/upgrades.rs` | Roguelike upgrade catalog: `Upgrade`, `Rarity`, `Upgrades` (levels held), costs. Data only. |
 | `src/save.rs` | `RunSave` plus pure `encode`/`decode` for the run save file. |
 | `src/words.rs` | Lowercase ASCII word pools (`SHORT`, `MID`, `LONG`). |
@@ -154,10 +157,24 @@ The look is "quiet field, loud words": a calm retro braille field where only
 the things the player acts on carry color. Hold to this when adding visuals.
 
 - **Layout.** The header is one row (row 0): wave, score, hearts, combo, and a
-  right-aligned best score. The dock is two rows: an input line (`›`, typed
-  text, then the rest of the locked word ghosted) and one hint line. `metrics()`
-  owns this (`origin_y = 1`, `dock_h = 2`). No rule lines or boxes; spacing and
-  color separate things. Do not add HUD rows without a strong reason.
+  right-aligned best score. Below the play area sits the typing stage, then a
+  two-row dock with one hint line (and the miss / match-count line above it).
+  `metrics()` owns all of it (`origin_y = 1`, `dock_h = 2`, `stage_h` from
+  `stage_height`: 0 below 22 rows, otherwise 5). The play area, spawns
+  and ship centre shrink to what remains; menus, the shop and the title draw
+  over the stage rows too. No rule lines or boxes except the stage's floor
+  line; spacing and color separate things. Do not add HUD rows without a strong
+  reason.
+- **The typing stage.** The locked word is drawn in big pixel letters
+  (`draw/stage.rs`): half-blocks (`▀▄`) in four rows above the floor line, two columns
+  per pixel when the word fits and one when it does not. Typed letters are `hot`
+  and slide up from the floor line, the untyped rest is `dim` and assembles by
+  pixel when the target locks, and a finished word dissolves upward
+  (`Game::spent`). Animation timing is read from `Game::buffer_t`, `lock_t` and
+  `spent`; `draw` never mutates them, and pixel noise is a hash, not the RNG.
+  Always clear the typed buffer with `clear_typed()` so the timestamps stay in
+  step with `buffer`. Below 22 rows `stage_h` is 0 and the dock falls back to
+  the one-line input (`draw_input_line`).
 - **Shop cards.** `draw_shop` lays out three framed cards by rarity: single
   line for common, heavy for the selected card, double line and `★` for rare.
   Prices use `pal.gem`, or `pal.danger` when unaffordable. Wrap descriptions
@@ -199,8 +216,10 @@ the things the player acts on carry color. Hold to this when adding visuals.
 2. Add a `Palette` const and the `palette()` arm.
 3. Add theme text arms in `game.rs` (banners, hints, scoring) and `draw.rs`
    (title subtitle, game-over text, prompts).
-4. Pick the ship renderer in the `match game.theme` block in `draw()`. Local
-   ship geometry belongs in `game.rs` as a `*_local()` function.
+4. Add the ship as a function in `src/draw/ships.rs` and a `draw_ship` arm
+   (plus its scale). Ships are described in square visual units with the nose
+   toward negative y and drawn through `Craft`, which rotates then squashes by
+   the cell aspect; do not hand-roll `to_px` calls.
 5. Give hazards a theme-specific silhouette in the rock loop if needed. Keep it
    to an outline plus one signature mark.
 6. Pick head and tail colors in `projectile_colors`. Do not write a new
@@ -259,7 +278,7 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
   helper and assert on the resulting text (e.g. menu labels and hint copy).
   Add a render assertion when you add player-visible strings or theme visuals.
 - Every behavior change should add or update a focused test. Keep the suite
-  green; currently 45 tests.
+  green; currently 49 tests.
 
 ## Gotchas
 

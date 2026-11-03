@@ -2,10 +2,13 @@
 //! braille line art; words sit on top in plain cells so they stay readable.
 
 use crate::game::{
-    cat_local, metrics, rotate, spaceship_local, submarine_local, Effect, Game, Phase, Rock, Theme,
-    SHOP_GO, SHOP_REROLL, SHOP_SLOTS,
+    metrics, rotate, Effect, Game, Metrics, Phase, Rock, Theme, SHOP_GO, SHOP_REROLL, SHOP_SLOTS,
 };
 use crate::upgrades::Rarity;
+
+mod bigfont;
+mod ships;
+mod stage;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
@@ -685,12 +688,7 @@ pub fn draw(frame: &mut Frame, game: &Game) {
 
     let blink_off = game.invuln > 0.0 && ((game.time * 14.0) as i32).rem_euclid(2) == 0;
     if !blink_off && game.phase != Phase::Shop {
-        match game.theme {
-            Theme::Space => draw_space_ship(&mut ink, game, pal, to_px),
-            Theme::Underwater => draw_submarine(&mut ink, game, pal, to_px),
-            Theme::Jungle => draw_monkey(&mut ink, game, pal, to_px),
-            Theme::CatCafe => draw_cat(&mut ink, game, pal, to_px),
-        }
+        ships::draw_ship(&mut ink, game, pal, to_px);
     }
 
     for y in 0..ink.h {
@@ -807,391 +805,18 @@ pub fn draw(frame: &mut Frame, game: &Game) {
     }
 
     draw_header(buf, game, pal, w);
-    draw_dock(buf, game, pal, w, m.dock_y);
-    draw_title(buf, game, pal, w, m);
-    draw_shop(buf, game, pal, w, m);
-    draw_modal(buf, game, pal, w, m);
-}
-
-fn draw_space_ship(
-    ink: &mut InkLayer,
-    game: &Game,
-    pal: &Palette,
-    to_px: impl Fn(f32, f32) -> (f32, f32),
-) {
-    let (cx, cy) = game.ship_pos();
-    let pts = spaceship_local(game.spin);
-    let world: Vec<(f32, f32)> = pts
-        .iter()
-        .map(|(lx, ly)| {
-            let (x, y) = rotate(*lx, *ly, game.angle);
-            (cx + x, cy + y)
-        })
-        .collect();
-    for i in 0..world.len() {
-        let a = world[i];
-        let b = world[(i + 1) % world.len()];
-        let (x0, y0) = to_px(a.0, a.1);
-        let (x1, y1) = to_px(b.0, b.1);
-        ink.line(x0, y0, x1, y1, 5, pal.ink);
+    if matches!(game.phase, Phase::Playing | Phase::Paused | Phase::Dying) {
+        stage::draw_stage(buf, game, pal, m);
     }
-
-    let flick = 0.55 + 0.45 * (game.time * 34.0).sin().abs();
-    let yaw = game.spin.abs() > 1.5;
-    if game.thrust > 0.04 || yaw {
-        let len = (0.25 + game.thrust * 1.55) * flick;
-        let (x0, y0) = rotate(0.0, 0.62, game.angle);
-        let (x1, y1) = rotate(0.0, 0.62 + len, game.angle);
-        let (a, b) = to_px(cx + x0, cy + y0);
-        let (c, d) = to_px(cx + x1, cy + y1);
-        ink.line(a, b, c, d, 5, pal.accent);
-        let (l0, l1) = rotate(-0.28, 0.7 + len * 0.65, game.angle);
-        let (r0, r1) = rotate(0.28, 0.7 + len * 0.65, game.angle);
-        let (p0, q0) = to_px(cx + l0, cy + l1);
-        let (p1, q1) = to_px(cx + r0, cy + r1);
-        let (n0, m0) = to_px(cx + x0, cy + y0);
-        ink.line(n0, m0, p0, q0, 5, pal.amber);
-        ink.line(n0, m0, p1, q1, 5, pal.amber);
-    }
-    if game.spin.abs() > 1.6 {
-        let side = if game.spin > 0.0 { -1.0 } else { 1.0 };
-        let (x0, y0) = rotate(side * 0.95, 0.55, game.angle);
-        let (x1, y1) = rotate(side * 1.7, 0.95, game.angle);
-        let (a, b) = to_px(cx + x0, cy + y0);
-        let (c, d) = to_px(cx + x1, cy + y1);
-        ink.line(a, b, c, d, 5, pal.amber);
-    }
-}
-
-fn draw_submarine(
-    ink: &mut InkLayer,
-    game: &Game,
-    pal: &Palette,
-    to_px: impl Fn(f32, f32) -> (f32, f32),
-) {
-    let (cx, cy) = game.ship_pos();
-    let place = |p: (f32, f32)| {
-        let (x, y) = rotate(p.0, p.1, game.angle);
-        (cx + x, cy + y)
+    draw_dock(buf, game, pal, m);
+    // Menus and the shop use the stage rows too; only play needs them.
+    let menu = Metrics {
+        play_h: m.play_h + m.stage_h,
+        ..m
     };
-    let seg = |ink: &mut InkLayer, a: (f32, f32), b: (f32, f32), pri: u8, col: Color| {
-        let (ax, ay) = place(a);
-        let (bx, by) = place(b);
-        let (x0, y0) = to_px(ax, ay);
-        let (x1, y1) = to_px(bx, by);
-        ink.line(x0, y0, x1, y1, pri, col);
-    };
-    let dot = |ink: &mut InkLayer, p: (f32, f32), pri: u8, col: Color| {
-        let (px, py) = place(p);
-        let (x, y) = to_px(px, py);
-        ink.dot(x, y, pri, col);
-    };
-
-    let pts = submarine_local(game.spin);
-    for i in 0..pts.len() {
-        seg(ink, pts[i], pts[(i + 1) % pts.len()], 5, pal.ink);
-    }
-    seg(ink, (0.0, -1.72), (0.0, 1.48), 4, pal.dim);
-
-    let bank = (-game.spin * 0.025).clamp(-0.5, 0.5) * 0.6;
-    let sail = [
-        (-0.45 + bank, -0.45),
-        (0.45 + bank, -0.45),
-        (0.54 + bank, -0.12),
-        (0.45 + bank, 0.55),
-        (0.24 + bank, 0.72),
-        (-0.24 + bank, 0.72),
-        (-0.45 + bank, 0.55),
-        (-0.54 + bank, -0.12),
-    ];
-    for i in 0..sail.len() {
-        seg(ink, sail[i], sail[(i + 1) % sail.len()], 5, pal.ink);
-    }
-    seg(ink, (-0.27 + bank, 0.03), (0.27 + bank, 0.03), 4, pal.amber);
-
-    // Periscope and bridge.
-    seg(ink, (0.0, -0.45), (0.0, -1.12), 4, pal.dim);
-    seg(ink, (-0.27, -1.04), (0.27, -1.04), 4, pal.hot);
-
-    // Portholes.
-    for py in [-1.15, 0.95] {
-        for px in [-0.45, 0.45] {
-            dot(ink, (px, py), 4, pal.amber);
-            dot(ink, (px * 0.78, py), 3, fade(pal.amber, 0.4));
-        }
-    }
-
-    // Bow planes and stern fins.
-    seg(ink, (0.68, -0.95), (1.52, -1.18), 4, pal.dim);
-    seg(ink, (-0.68, -0.95), (-1.52, -1.18), 4, pal.dim);
-    seg(ink, (0.52, 1.05), (1.36, 1.45), 4, pal.dim);
-    seg(ink, (-0.52, 1.05), (-1.36, 1.45), 4, pal.dim);
-
-    // Spinning propeller.
-    let prop_y = 1.62;
-    let prop = game.time * (7.0 + game.thrust * 18.0);
-    for i in 0..3 {
-        let a = prop + i as f32 * std::f32::consts::TAU / 3.0;
-        let tip = (a.cos() * 0.72, prop_y + a.sin() * 0.32);
-        seg(ink, (0.0, prop_y), tip, 4, fade(pal.accent, 0.75));
-        dot(ink, tip, 3, pal.accent);
-    }
-    dot(ink, (0.0, prop_y), 5, pal.hot);
-
-    let yaw = game.spin.abs() > 1.5;
-    if game.thrust > 0.04 || yaw {
-        let flick = 0.55 + 0.45 * (game.time * 34.0).sin().abs();
-        let len = (0.25 + game.thrust * 1.15) * flick;
-        seg(
-            ink,
-            (0.0, 1.78),
-            (0.0, 1.78 + len),
-            5,
-            fade(pal.accent, 0.75),
-        );
-        dot(ink, (-0.11, 1.9 + len * 0.45), 3, pal.hot);
-        dot(ink, (0.09, 2.0 + len * 0.65), 3, pal.accent);
-    }
-    if game.spin.abs() > 1.6 {
-        let side = if game.spin > 0.0 { -1.0 } else { 1.0 };
-        seg(ink, (side * 1.3, 1.08), (side * 1.7, 1.5), 5, pal.amber);
-    }
-}
-
-fn draw_monkey(
-    ink: &mut InkLayer,
-    game: &Game,
-    pal: &Palette,
-    to_px: impl Fn(f32, f32) -> (f32, f32),
-) {
-    let (cx, cy) = game.ship_pos();
-    // The monkey reads better a little larger than the other ships.
-    let scale = 2.0;
-    let place = |p: (f32, f32)| {
-        let (x, y) = rotate(p.0 * scale, p.1 * scale, game.angle);
-        (cx + x, cy + y)
-    };
-    let seg = |ink: &mut InkLayer, a: (f32, f32), b: (f32, f32), pri: u8, col: Color| {
-        let (ax, ay) = place(a);
-        let (bx, by) = place(b);
-        let (x0, y0) = to_px(ax, ay);
-        let (x1, y1) = to_px(bx, by);
-        ink.line(x0, y0, x1, y1, pri, col);
-    };
-    let dot = |ink: &mut InkLayer, p: (f32, f32), pri: u8, col: Color| {
-        let (px, py) = place(p);
-        let (x, y) = to_px(px, py);
-        ink.dot(x, y, pri, col);
-    };
-    let ring = |ink: &mut InkLayer,
-                center: (f32, f32),
-                rx: f32,
-                ry: f32,
-                steps: usize,
-                pri: u8,
-                col: Color| {
-        let mut prev = (center.0 + rx, center.1);
-        for i in 1..=steps {
-            let a = i as f32 / steps as f32 * TAU;
-            let p = (center.0 + a.cos() * rx, center.1 + a.sin() * ry);
-            seg(ink, prev, p, pri, col);
-            prev = p;
-        }
-    };
-
-    // Tail curls behind the body.
-    let wag = (game.time * 2.6).sin() * 0.16 + game.spin * 0.03;
-    seg(ink, (0.0, 1.0), (0.3, 1.5 + wag), 3, pal.dim);
-    seg(ink, (0.3, 1.5 + wag), (0.9, 1.7 + wag), 3, pal.dim);
-    seg(ink, (0.9, 1.7 + wag), (1.2, 1.4 + wag), 3, pal.dim);
-    seg(ink, (1.2, 1.4 + wag), (1.05, 1.1 + wag), 3, pal.dim);
-
-    // Legs and feet.
-    seg(ink, (-0.3, 1.1), (-0.42, 1.5), 4, pal.ink);
-    seg(ink, (-0.42, 1.5), (-0.65, 1.55), 4, pal.ink);
-    seg(ink, (0.3, 1.1), (0.42, 1.5), 4, pal.ink);
-    seg(ink, (0.42, 1.5), (0.65, 1.55), 4, pal.ink);
-
-    // Body and head.
-    ring(ink, (0.0, 0.52), 0.55, 0.62, 12, 5, pal.ink);
-    ring(ink, (0.0, -0.82), 0.75, 0.75, 12, 5, pal.ink);
-
-    // Ears.
-    ring(ink, (-0.88, -0.85), 0.28, 0.3, 8, 5, pal.ink);
-    ring(ink, (0.88, -0.85), 0.28, 0.3, 8, 5, pal.ink);
-
-    // Face.
-    dot(ink, (-0.28, -0.96), 5, pal.hot);
-    dot(ink, (0.28, -0.96), 5, pal.hot);
-    dot(ink, (-0.1, -1.22), 4, pal.dim);
-    dot(ink, (0.1, -1.22), 4, pal.dim);
-    seg(ink, (-0.18, -1.32), (0.18, -1.32), 4, pal.dim);
-
-    // Hair tuft.
-    seg(ink, (0.0, -1.56), (-0.12, -1.76), 3, pal.ink);
-    seg(ink, (0.0, -1.56), (0.12, -1.76), 3, pal.ink);
-
-    // Arms. The right hand swings forward whenever a banana is thrown.
-    seg(ink, (-0.5, 0.15), (-0.95, 0.45), 4, pal.ink);
-    seg(ink, (-0.95, 0.45), (-1.15, 0.85), 4, pal.ink);
-    dot(ink, (-1.15, 0.85), 4, pal.ink);
-
-    // A banana ready in the other hand.
-    seg(ink, (-1.1, 0.76), (-1.3, 0.9), 4, pal.amber);
-    seg(ink, (-1.3, 0.9), (-1.18, 1.07), 4, pal.amber);
-    dot(ink, (-1.14, 1.09), 4, pal.hot);
-
-    let throw = game.thrust.clamp(0.0, 1.0);
-    let elbow = (0.9, 0.5 - 0.3 * throw);
-    let hand = (1.12 + 0.3 * throw, 0.7 - 1.4 * throw);
-    seg(ink, (0.5, 0.15), elbow, 4, pal.ink);
-    seg(ink, elbow, hand, 4, pal.ink);
-    dot(ink, hand, 4, pal.ink);
-}
-
-fn draw_cat(
-    ink: &mut InkLayer,
-    game: &Game,
-    pal: &Palette,
-    to_px: impl Fn(f32, f32) -> (f32, f32),
-) {
-    let (cx, cy) = game.ship_pos();
-    let scale = 1.9;
-    let place = |p: (f32, f32)| {
-        let (x, y) = rotate(p.0 * scale, p.1 * scale, game.angle);
-        (cx + x, cy + y)
-    };
-    let seg = |ink: &mut InkLayer, a: (f32, f32), b: (f32, f32), pri: u8, col: Color| {
-        let (ax, ay) = place(a);
-        let (bx, by) = place(b);
-        let (x0, y0) = to_px(ax, ay);
-        let (x1, y1) = to_px(bx, by);
-        ink.line(x0, y0, x1, y1, pri, col);
-    };
-    let dot = |ink: &mut InkLayer, p: (f32, f32), pri: u8, col: Color| {
-        let (px, py) = place(p);
-        let (x, y) = to_px(px, py);
-        ink.dot(x, y, pri, col);
-    };
-    let ring = |ink: &mut InkLayer,
-                center: (f32, f32),
-                rx: f32,
-                ry: f32,
-                steps: usize,
-                pri: u8,
-                col: Color| {
-        let mut prev = (center.0 + rx, center.1);
-        for i in 1..=steps {
-            let a = i as f32 / steps as f32 * TAU;
-            let p = (center.0 + a.cos() * rx, center.1 + a.sin() * ry);
-            seg(ink, prev, p, pri, col);
-            prev = p;
-        }
-    };
-
-    let tilt = (-game.spin * 0.03).clamp(-0.35, 0.35);
-
-    // Fluffy tail swishing cutely behind the body.
-    let wag = (game.time * 3.2).sin() * 0.35 + game.spin * 0.05;
-    seg(ink, (0.0, 1.05), (0.2 + wag * 0.4, 1.45), 4, pal.dim);
-    seg(
-        ink,
-        (0.2 + wag * 0.4, 1.45),
-        (0.55 + wag * 0.8, 1.75),
-        4,
-        pal.dim,
-    );
-    seg(
-        ink,
-        (0.55 + wag * 0.8, 1.75),
-        (0.85 + wag * 1.2, 1.6),
-        4,
-        pal.dim,
-    );
-    dot(ink, (0.85 + wag * 1.2, 1.6), 4, pal.amber);
-
-    // Hind paws tucked under body.
-    seg(ink, (-0.45, 0.95), (-0.65, 1.25), 4, pal.ink);
-    seg(ink, (0.45, 0.95), (0.65, 1.25), 4, pal.ink);
-
-    // Body.
-    ring(ink, (0.0, 0.45), 0.62, 0.68, 12, 5, pal.ink);
-
-    // Front paws: left paw rests forward, right paw swipes out on thrust / scratch.
-    seg(ink, (-0.45, 0.1), (-0.68, -0.25), 4, pal.ink);
-    dot(ink, (-0.68, -0.25), 5, pal.ink);
-
-    let swipe = game.thrust.clamp(0.0, 1.0);
-    let paw_x = 0.68 + 0.35 * swipe;
-    let paw_y = -0.25 - 0.75 * swipe;
-    seg(ink, (0.45, 0.1), (paw_x, paw_y), 4, pal.ink);
-    dot(
-        ink,
-        (paw_x, paw_y),
-        5,
-        if swipe > 0.3 { pal.amber } else { pal.ink },
-    );
-    if swipe > 0.3 {
-        // Little claws extended from the paw!
-        seg(
-            ink,
-            (paw_x, paw_y),
-            (paw_x + 0.15, paw_y - 0.25),
-            5,
-            pal.hot,
-        );
-        seg(
-            ink,
-            (paw_x, paw_y),
-            (paw_x - 0.15, paw_y - 0.25),
-            5,
-            pal.hot,
-        );
-    }
-
-    // Head.
-    ring(ink, (0.0 + tilt, -0.55), 0.72, 0.62, 10, 5, pal.ink);
-
-    // Pointed cat ears from local geometry.
-    let ears = cat_local(game.spin);
-    for i in 0..ears.len() - 1 {
-        seg(ink, ears[i], ears[i + 1], 5, pal.ink);
-    }
-
-    // Inner ear warm shading.
-    seg(
-        ink,
-        (-0.52 + tilt, -0.95),
-        (-0.48 + tilt, -1.45),
-        4,
-        pal.amber,
-    );
-    seg(
-        ink,
-        (0.52 + tilt, -0.95),
-        (0.48 + tilt, -1.45),
-        4,
-        pal.amber,
-    );
-
-    // Golden cat eyes with soft light glint.
-    dot(ink, (-0.28 + tilt, -0.65), 5, pal.amber);
-    dot(ink, (0.28 + tilt, -0.65), 5, pal.amber);
-    dot(ink, (-0.28 + tilt, -0.72), 5, pal.hot);
-    dot(ink, (0.28 + tilt, -0.72), 5, pal.hot);
-
-    // Cute nose and mouth.
-    dot(ink, (0.0 + tilt, -0.45), 5, pal.danger);
-    seg(ink, (-0.16 + tilt, -0.35), (0.0 + tilt, -0.4), 4, pal.dim);
-    seg(ink, (0.0 + tilt, -0.4), (0.16 + tilt, -0.35), 4, pal.dim);
-
-    // Whiskers framing the face.
-    seg(ink, (-0.6 + tilt, -0.52), (-1.35 + tilt, -0.68), 3, pal.dim);
-    seg(ink, (-0.6 + tilt, -0.42), (-1.4 + tilt, -0.4), 3, pal.dim);
-    seg(ink, (-0.6 + tilt, -0.32), (-1.32 + tilt, -0.15), 3, pal.dim);
-    seg(ink, (0.6 + tilt, -0.52), (1.35 + tilt, -0.68), 3, pal.dim);
-    seg(ink, (0.6 + tilt, -0.42), (1.4 + tilt, -0.4), 3, pal.dim);
-    seg(ink, (0.6 + tilt, -0.32), (1.32 + tilt, -0.15), 3, pal.dim);
+    draw_title(buf, game, pal, w, menu);
+    draw_shop(buf, game, pal, w, menu);
+    draw_modal(buf, game, pal, w, menu);
 }
 
 fn draw_label(
@@ -1367,7 +992,8 @@ fn play_hint(game: &Game, word: &str, nmatch: usize) -> String {
 }
 
 /// Two rows: an input line and one line of context. No rules or boxes.
-fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u16, dock_y: u16) {
+fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, m: Metrics) {
+    let dock_y = m.dock_y;
     let y1 = dock_y as i32;
     let y2 = dock_y as i32 + 1;
     let bold = Modifier::BOLD;
@@ -1448,50 +1074,81 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u
         Phase::Playing => {
             let word = game.target_word().unwrap_or("");
             let nmatch = game.matches();
-            let missed = game.miss > 0.0;
-            let accent = if missed { pal.danger } else { pal.amber };
-            put(buf, 2, y1, "›", style(accent).add_modifier(bold));
-
-            if game.miss > 0.08 && game.buffer.is_empty() {
-                let msg = match game.theme {
-                    Theme::Space => "no rock starts with that",
-                    Theme::Underwater => "no mine starts with that",
-                    Theme::Jungle => "no coconut starts with that",
-                    Theme::CatCafe => "no coffee starts with that",
-                };
-                put(buf, 4, y1, msg, style(pal.danger).add_modifier(bold));
-            } else {
-                let typed_col = if missed { pal.danger } else { pal.hot };
-                let mut x = write(
-                    buf,
-                    4,
-                    dock_y,
-                    &game.buffer,
-                    style(typed_col).add_modifier(bold),
-                );
-                let cursor = if ((game.time * 3.0) as i32).rem_euclid(2) == 0 {
-                    "█"
-                } else {
-                    " "
-                };
-                x = write(buf, x, dock_y, cursor, style(accent));
-                // The rest of the locked word, ghosted after the cursor.
-                let rest = word.get(game.buffer.len()..).unwrap_or("");
-                x = write(buf, x, dock_y, rest, style(pal.faint));
-                if nmatch > 1 {
+            if m.stage_h > 0 {
+                // The stage shows the word; the dock only reports problems.
+                if game.miss > 0.08 && game.buffer.is_empty() {
                     put(
                         buf,
-                        x as i32 + 2,
+                        2,
                         y1,
-                        &format!("{nmatch} match"),
-                        style(pal.dim),
+                        miss_message(game.theme),
+                        style(pal.danger).add_modifier(bold),
                     );
+                } else if nmatch > 1 {
+                    put(buf, 2, y1, &format!("{nmatch} match"), style(pal.dim));
                 }
+            } else {
+                draw_input_line(buf, game, pal, dock_y);
             }
             put(buf, 2, y2, &play_hint(game, word, nmatch), style(pal.dim));
         }
     }
-    let _ = w;
+}
+
+fn miss_message(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Space => "no rock starts with that",
+        Theme::Underwater => "no mine starts with that",
+        Theme::Jungle => "no coconut starts with that",
+        Theme::CatCafe => "no coffee starts with that",
+    }
+}
+
+/// The one-line input used when the terminal is too short for the stage.
+fn draw_input_line(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, dock_y: u16) {
+    let y1 = dock_y as i32;
+    let bold = Modifier::BOLD;
+    let word = game.target_word().unwrap_or("");
+    let nmatch = game.matches();
+    let missed = game.miss > 0.0;
+    let accent = if missed { pal.danger } else { pal.amber };
+    put(buf, 2, y1, "›", style(accent).add_modifier(bold));
+    if game.miss > 0.08 && game.buffer.is_empty() {
+        put(
+            buf,
+            4,
+            y1,
+            miss_message(game.theme),
+            style(pal.danger).add_modifier(bold),
+        );
+        return;
+    }
+    let typed_col = if missed { pal.danger } else { pal.hot };
+    let mut x = write(
+        buf,
+        4,
+        dock_y,
+        &game.buffer,
+        style(typed_col).add_modifier(bold),
+    );
+    let cursor = if ((game.time * 3.0) as i32).rem_euclid(2) == 0 {
+        "█"
+    } else {
+        " "
+    };
+    x = write(buf, x, dock_y, cursor, style(accent));
+    // The rest of the locked word, ghosted after the cursor.
+    let rest = word.get(game.buffer.len()..).unwrap_or("");
+    x = write(buf, x, dock_y, rest, style(pal.faint));
+    if nmatch > 1 {
+        put(
+            buf,
+            x as i32 + 2,
+            y1,
+            &format!("{nmatch} match"),
+            style(pal.dim),
+        );
+    }
 }
 
 fn draw_title(
@@ -2372,7 +2029,8 @@ mod tests {
             hit: 0.0,
         });
         game.type_char(word.chars().next().unwrap());
-        for _ in 0..6 {
+        // Long enough for the stage animations to settle.
+        for _ in 0..30 {
             game.update(1.0 / 60.0);
         }
         game
@@ -2389,11 +2047,69 @@ mod tests {
             assert!(rows[0].contains("BEST"), "{screen}");
             assert!(!screen.contains("HULL"), "{screen}");
             assert!(screen.contains("‹comet›"), "locked chip\n{screen}");
-            // Input line carries the typed letter and the ghosted remainder.
-            assert!(rows[22].contains("›"), "{screen}");
-            assert!(rows[22].contains("omet"), "{screen}");
             assert!(rows[23].contains("finish the word"), "{screen}");
         }
+    }
+
+    fn stage_rows(screen: &str, from: usize, to: usize) -> String {
+        screen
+            .lines()
+            .skip(from)
+            .take(to - from)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_stage_draws_the_locked_word_in_big_letters() {
+        for theme in Theme::ALL {
+            let game = locked_rock_game(theme, "comet");
+            // 80x24: header, 16 play rows, a 5-row stage (rows 17..22), 2 dock rows.
+            let screen = render(&game, 80, 24);
+            let stage = stage_rows(&screen, 17, 21);
+            assert!(stage.contains('█'), "typed letter\n{screen}");
+            assert!(stage.contains('▀') || stage.contains('▄'), "{screen}");
+            assert!(screen.lines().nth(21).unwrap().starts_with('─'), "{screen}");
+            // Five letters of 10 columns each fill most of the row; the old
+            // one-line input is gone.
+            assert!(!screen.lines().nth(22).unwrap().contains('›'), "{screen}");
+        }
+    }
+
+    #[test]
+    fn tall_terminals_keep_the_same_small_stage() {
+        let game = locked_rock_game(Theme::Space, "comet");
+        let screen = render(&game, 80, 48);
+        // 1 header, 40 play rows, a 5-row stage from row 41, 2 dock rows.
+        let stage = stage_rows(&screen, 41, 45);
+        assert!(stage.contains('█'), "{screen}");
+        assert!(screen.lines().nth(45).unwrap().starts_with('─'), "{screen}");
+    }
+
+    #[test]
+    fn short_terminals_keep_the_one_line_input() {
+        let game = locked_rock_game(Theme::Space, "comet");
+        let screen = render(&game, 70, 20);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(
+            rows[18].contains('›') && rows[18].contains("omet"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn letters_rise_from_the_floor_after_being_typed() {
+        let mut game = locked_rock_game(Theme::Space, "comet");
+        game.update(0.0);
+        let settled = stage_rows(&render(&game, 80, 24), 17, 21);
+        // Type the next letter: for an instant it is still below the floor.
+        game.type_char('o');
+        let fresh = stage_rows(&render(&game, 80, 24), 17, 21);
+        let blocks = |s: &str| s.chars().filter(|c| "█▀▄".contains(*c)).count();
+        assert!(blocks(&settled) > 0, "{settled}");
+        game.update(0.3);
+        let risen = stage_rows(&render(&game, 80, 24), 17, 21);
+        assert!(blocks(&risen) > blocks(&fresh), "{risen}\n---\n{fresh}");
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub const SHOP_REROLL: usize = SHOP_SLOTS;
 pub const SHOP_GO: usize = SHOP_SLOTS + 1;
 const SHOP_ENTRIES: usize = SHOP_SLOTS + 2;
 const BASE_HEARTS: u32 = 3;
-const REROLL_BASE: u32 = 3;
+const REROLL_BASE: u32 = 10;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
@@ -246,6 +246,12 @@ pub struct Game {
     pub shop_note: String,
     pub combo: u32,
     pub buffer: String,
+    /// `time` at which each letter of `buffer` was typed (drives the stage animation).
+    pub buffer_t: Vec<f32>,
+    /// `time` at which the current target was locked.
+    pub lock_t: f32,
+    /// The word just finished, kept briefly so the stage can shatter it.
+    pub spent: Option<Spent>,
     pub target: Option<u32>,
     pub rocks: Vec<Rock>,
     pub effects: Vec<Effect>,
@@ -330,44 +336,11 @@ pub fn angle_delta(from: f32, to: f32) -> f32 {
     d
 }
 
-pub fn submarine_local(spin: f32) -> [(f32, f32); 12] {
-    let bank = (-spin * 0.025).clamp(-0.5, 0.5);
-    [
-        (0.0, -2.05),
-        (0.68 + bank, -1.75),
-        (1.02 + bank, -1.15),
-        (1.16 + bank, -0.35),
-        (1.08 + bank, 0.65),
-        (0.76 + bank, 1.25),
-        (0.0, 1.55),
-        (-0.76 + bank, 1.25),
-        (-1.08 + bank, 0.65),
-        (-1.16 + bank, -0.35),
-        (-1.02 + bank, -1.15),
-        (-0.68 + bank, -1.75),
-    ]
-}
-
-pub fn spaceship_local(spin: f32) -> [(f32, f32); 4] {
-    let bank = (-spin * 0.035).clamp(-0.4, 0.4);
-    [
-        (0.0, -1.75),
-        (1.2 + bank, 1.2),
-        (bank * 0.4, 0.55),
-        (-1.2 + bank, 1.2),
-    ]
-}
-
-pub fn cat_local(spin: f32) -> [(f32, f32); 6] {
-    let tilt = (-spin * 0.03).clamp(-0.35, 0.35);
-    [
-        (-0.68 + tilt, -0.85), // Left ear outer base
-        (-0.62 + tilt, -1.65), // Left ear tip
-        (-0.18 + tilt, -1.15), // Forehead left
-        (0.18 + tilt, -1.15),  // Forehead right
-        (0.62 + tilt, -1.65),  // Right ear tip
-        (0.68 + tilt, -0.85),  // Right ear outer base
-    ]
+/// A finished word on its way off the stage.
+#[derive(Clone)]
+pub struct Spent {
+    pub word: String,
+    pub t0: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -375,7 +348,21 @@ pub struct Metrics {
     pub play_w: u16,
     pub play_h: u16,
     pub origin_y: u16,
+    /// First row of the typing stage; its last row is the floor line.
+    pub stage_y: u16,
+    /// Rows in the stage, floor line included. Zero on very short terminals.
+    pub stage_h: u16,
     pub dock_y: u16,
+}
+
+/// Rows the big-letter stage takes: none when the terminal is too short,
+/// otherwise five (a floor line under four rows of half-block letters).
+fn stage_height(term_h: u16) -> u16 {
+    if term_h < 22 {
+        0
+    } else {
+        5
+    }
 }
 
 /// Downward pull on spilled droplets, in cells per second squared.
@@ -384,12 +371,15 @@ const DROP_GRAVITY: f32 = 26.0;
 pub fn metrics(term_w: u16, term_h: u16) -> Metrics {
     let dock_h = 2;
     let origin_y = 1;
-    let play_h = term_h.saturating_sub(origin_y + dock_h);
+    let stage_h = stage_height(term_h);
+    let play_h = term_h.saturating_sub(origin_y + stage_h + dock_h);
     Metrics {
         play_w: term_w,
         play_h,
         origin_y,
-        dock_y: origin_y + play_h,
+        stage_y: origin_y + play_h,
+        stage_h,
+        dock_y: origin_y + play_h + stage_h,
     }
 }
 
@@ -417,6 +407,9 @@ impl Game {
             shop_note: String::new(),
             combo: 0,
             buffer: String::new(),
+            buffer_t: Vec::new(),
+            lock_t: 0.0,
+            spent: None,
             target: None,
             rocks: Vec::new(),
             effects: Vec::new(),
@@ -597,8 +590,8 @@ impl Game {
     fn reset_run(&mut self) {
         self.rocks.clear();
         self.effects.clear();
-        self.buffer.clear();
-        self.target = None;
+        self.clear_typed();
+        self.spent = None;
         self.score = 0;
         self.lives = BASE_HEARTS;
         self.crystals = 0;
@@ -633,6 +626,13 @@ impl Game {
         self.banner_t = 0.0;
     }
 
+    /// Forget what the player has typed and the hazard it locked.
+    fn clear_typed(&mut self) {
+        self.buffer.clear();
+        self.buffer_t.clear();
+        self.target = None;
+    }
+
     pub fn type_char(&mut self, c: char) {
         if self.phase != Phase::Playing || self.pending_clear {
             return;
@@ -654,6 +654,7 @@ impl Game {
             return;
         }
         self.buffer = next;
+        self.buffer_t.push(self.time);
         self.lock_target();
         let Some(id) = self.target else {
             return;
@@ -670,6 +671,7 @@ impl Game {
             return;
         }
         self.buffer.pop();
+        self.buffer_t.pop();
         if self.buffer.is_empty() {
             self.target = None;
         } else {
@@ -769,8 +771,7 @@ impl Game {
                 Theme::CatCafe => "CAFE CLEAR".to_string(),
             };
             self.banner_t = 1.45;
-            self.buffer.clear();
-            self.target = None;
+            self.clear_typed();
         }
     }
 
@@ -891,6 +892,7 @@ impl Game {
             }
         }
         let (sx, sy) = self.ship_center();
+        let before = self.target;
         self.target = self
             .rocks
             .iter()
@@ -901,6 +903,9 @@ impl Game {
                 da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|r| r.id);
+        if self.target != before {
+            self.lock_t = self.time;
+        }
     }
 
     fn fire_at(&mut self, id: u32, kill: bool) {
@@ -1017,8 +1022,18 @@ impl Game {
         }
         self.burst(x, y, radius);
         self.rocks.retain(|r| r.id != id);
-        self.buffer.clear();
-        self.target = None;
+        self.clear_typed();
+        // Chained kills fire in the same instant; the typed word keeps the stage.
+        let stale = match &self.spent {
+            Some(s) => self.time - s.t0 > 0.3,
+            None => true,
+        };
+        if stale {
+            self.spent = Some(Spent {
+                word: word.to_string(),
+                t0: self.time,
+            });
+        }
     }
 
     /// Multishot: a kill also pops the nearest hazard with a short word. The
@@ -1181,8 +1196,7 @@ impl Game {
             self.shake = 0.3;
             self.burst(x, y, radius);
             self.rocks.retain(|r| r.id != id);
-            self.buffer.clear();
-            self.target = None;
+            self.clear_typed();
             return;
         }
         self.lives = self.lives.saturating_sub(1);
@@ -1197,8 +1211,7 @@ impl Game {
         self.shake = 0.45;
         self.combo = 0;
         self.combo_left = 0.0;
-        self.buffer.clear();
-        self.target = None;
+        self.clear_typed();
         let kx = self.rng.range(-1.0, 1.0);
         let ky = self.rng.range(-1.0, 1.0);
         self.kick(kx, ky, 10.0);
@@ -1229,8 +1242,7 @@ impl Game {
     /// Enter the shop. `pay_interest` is false when resuming a saved shop.
     fn open_shop(&mut self, pay_interest: bool) {
         self.phase = Phase::Shop;
-        self.buffer.clear();
-        self.target = None;
+        self.clear_typed();
         self.shop_note.clear();
         if pay_interest && self.upgrades.has(Upgrade::Interest) {
             let gain = (self.crystals / 5).min(5);
@@ -1615,10 +1627,10 @@ impl Game {
         // Sparse exhaust: one dim dot every so often, drifting back from the hull.
         let period = 0.06;
         let (back, speed) = match self.theme {
-            Theme::Space => (1.15, 9.0),
-            Theme::Underwater => (1.72, 7.5),
-            Theme::Jungle => (1.05, 4.0),
-            Theme::CatCafe => (1.1, 5.0),
+            Theme::Space => (1.45, 9.0),
+            Theme::Underwater => (1.95, 7.5),
+            Theme::Jungle => (1.4, 4.0),
+            Theme::CatCafe => (1.65, 5.0),
         };
         while self.exhaust > period {
             self.exhaust -= period;
