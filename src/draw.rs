@@ -1922,8 +1922,32 @@ fn draw_shop(
     );
 
     let cards_y = top + 3;
-    for (slot, offer) in shop.offers.iter().enumerate() {
+    for slot in 0..SHOP_SLOTS {
         let x = left + slot as i32 * (card_w + gap);
+        let Some(offer) = shop.offers.get(slot) else {
+            // Nothing left to sell: keep the slot on screen, clearly empty.
+            let selected = game.shop_sel == slot;
+            let edge = if selected { pal.hot } else { pal.faint };
+            draw_frame(
+                buf,
+                (x, cards_y, card_w, card_h),
+                ["┌", "┐", "└", "┘", "─", "│"],
+                style(edge),
+                pal.chip,
+            );
+            put_centered(
+                buf,
+                x,
+                card_w,
+                cards_y + card_h / 2,
+                "SOLD OUT",
+                Style::default()
+                    .fg(pal.dim)
+                    .bg(pal.chip)
+                    .add_modifier(Modifier::BOLD),
+            );
+            continue;
+        };
         let def = offer.upgrade.def();
         let selected = game.shop_sel == slot;
         let rare = def.rarity == Rarity::Rare;
@@ -1984,7 +2008,10 @@ fn draw_shop(
             }),
         );
         let desc_rows = (card_h - 6).max(1) as usize;
-        for (i, line) in wrap(def.desc, inner).iter().take(desc_rows).enumerate() {
+        let blurb = offer
+            .upgrade
+            .blurb(game.upgrades.level(offer.upgrade).saturating_add(1));
+        for (i, line) in wrap(&blurb, inner).iter().take(desc_rows).enumerate() {
             put(
                 buf,
                 x + 2,
@@ -2418,6 +2445,21 @@ mod tests {
             5,
             "{top}"
         );
+    }
+
+    #[test]
+    fn an_empty_shop_still_draws_sold_out_slots() {
+        let mut game = locked_rock_game(Theme::Underwater, "comet");
+        game.rocks.clear();
+        for up in crate::upgrades::Upgrade::ALL {
+            game.upgrades.set(up, up.def().max);
+        }
+        game.lives = game.max_lives();
+        game.open_shop_for_test();
+        let screen = render(&game, 80, 24);
+        assert_eq!(screen.matches("SOLD OUT").count(), 3, "{screen}");
+        assert!(screen.contains("NEXT WAVE"), "{screen}");
+        assert!(screen.contains("Sold out!"), "{screen}");
     }
 
     #[test]

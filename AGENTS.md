@@ -101,8 +101,14 @@ in a three-card shop that opens after every cleared wave (`Phase::Shop`).
   hook in `game.rs` and a focused test; (3) if it changes what the player sees,
   update `draw.rs` and add a render assertion. Save files use the `key` string,
   so never rename a key.
-- **Rarity and cost.** Rare upgrades should be unique rule-benders (single
-  level, a different way to play), not bigger numbers. Cost is
+- **Rarity and cost.** Rare upgrades should be rule-benders, not bigger
+  numbers. Most are single level; a rare may stack when each level deepens the
+  rule (Focus slows the typed word more, Scattershot adds Multishot targets).
+  An upgrade that only improves another must gate itself in `eligible`.
+- **Level-aware card text.** `Upgrade::blurb(next_level)` spells out the next
+  step for stacking upgrades (Multishot letters, Scattershot words, Focus
+  speed). Put such numbers in the shared helper next to it
+  (`multishot_letters`, `focus_pace`) so the card and the simulation agree. Cost is
   `Rarity::base_cost + 2 per level held`; patch kits are flat.
 - **Saves.** `~/.typoids-run` holds a `RunSave` (wave, score, lives, crystals,
   kills, revive flag, upgrades, and whether to resume in the shop). It is
@@ -253,7 +259,7 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
   helper and assert on the resulting text (e.g. menu labels and hint copy).
   Add a render assertion when you add player-visible strings or theme visuals.
 - Every behavior change should add or update a focused test. Keep the suite
-  green; currently 41 tests.
+  green; currently 45 tests.
 
 ## Gotchas
 

@@ -791,14 +791,19 @@ impl Game {
     fn integrate_rocks(&mut self, dt: f32, collide: bool) {
         let (sx, sy) = self.ship_pos();
         let mut hits = Vec::new();
-        let mut pace = 1.0 - 0.1 * self.upgrades.level(Upgrade::SlowTide) as f32;
-        if collide && self.upgrades.has(Upgrade::Focus) && !self.buffer.is_empty() {
-            pace *= 0.67;
-        }
+        let pace = 1.0 - 0.1 * self.upgrades.level(Upgrade::SlowTide) as f32;
+        // Focus slows only the hazard being typed.
+        let focus = Upgrade::focus_pace(self.upgrades.level(Upgrade::Focus));
+        let typed = if collide { self.target } else { None };
         for rock in &mut self.rocks {
             if !rock.live {
                 continue;
             }
+            let pace = if Some(rock.id) == typed {
+                pace * focus
+            } else {
+                pace
+            };
             rock.x += rock.vx * dt * pace;
             rock.y += rock.vy * dt * pace;
             rock.rot += rock.spin * dt;
@@ -1016,14 +1021,21 @@ impl Game {
         self.target = None;
     }
 
-    /// Multishot: a kill also pops the nearest short-worded hazards.
+    /// Multishot: a kill also pops the nearest hazard with a short word. The
+    /// word length grows with Multishot; Scattershot adds more targets.
     fn chain_kills(&mut self, x: f32, y: f32) {
+        let level = self.upgrades.level(Upgrade::Multishot);
+        if level == 0 {
+            return;
+        }
+        let longest = Upgrade::multishot_letters(level);
+        let targets = 1 + self.upgrades.level(Upgrade::Scattershot);
         let (sx, sy) = self.ship_center();
-        for _ in 0..self.upgrades.level(Upgrade::Multishot) {
+        for _ in 0..targets {
             let pick = self
                 .rocks
                 .iter()
-                .filter(|r| r.live && r.word.len() <= 4)
+                .filter(|r| r.live && r.word.len() <= longest)
                 .min_by(|a, b| {
                     let da = (a.x - sx).powi(2) + (a.y - sy).powi(2);
                     let db = (b.x - sx).powi(2) + (b.y - sy).powi(2);
@@ -1228,6 +1240,9 @@ impl Game {
             }
         }
         let offers = self.roll_offers();
+        if offers.is_empty() {
+            self.shop_note = "Sold out! You own everything. Head on to the next wave.".to_string();
+        }
         self.shop = Some(Shop { offers, rerolls: 0 });
         self.shop_sel = 0;
         self.autosave(true);
@@ -1236,6 +1251,10 @@ impl Game {
     fn eligible(&self, up: Upgrade) -> bool {
         match up {
             Upgrade::PatchKit => self.lives < self.max_lives(),
+            // Scattershot only improves Multishot.
+            Upgrade::Scattershot => {
+                self.upgrades.has(Upgrade::Multishot) && !self.upgrades.maxed(up)
+            }
             _ => !self.upgrades.maxed(up),
         }
     }
@@ -1322,6 +1341,11 @@ impl Game {
 
     pub fn shop_reroll(&mut self) {
         if self.phase != Phase::Shop {
+            return;
+        }
+        if !Upgrade::ALL.into_iter().any(|u| self.eligible(u)) {
+            // Rerolling would only show the same empty shelf.
+            self.shop_note = "Sold out! Nothing left to sell.".to_string();
             return;
         }
         let cost = self.reroll_cost();
@@ -1986,6 +2010,25 @@ mod tests {
     }
 
     #[test]
+    fn a_shop_with_nothing_left_says_sold_out() {
+        let mut g = playing();
+        for up in Upgrade::ALL {
+            g.upgrades.set(up, up.def().max);
+        }
+        g.lives = g.max_lives();
+        g.crystals = 100;
+        g.open_shop(false);
+        assert!(g.shop.as_ref().unwrap().offers.is_empty());
+        assert!(g.shop_note.contains("Sold out"));
+        g.shop_reroll();
+        assert_eq!(g.crystals, 100, "no charge for rerolling an empty shelf");
+        g.shop_buy(0);
+        assert_eq!(g.crystals, 100);
+        g.leave_shop();
+        assert_eq!(g.phase, Phase::Playing, "can still move on");
+    }
+
+    #[test]
     fn rerolling_costs_more_each_time_and_haggler_gives_one_free() {
         let mut g = playing();
         g.open_shop(false);
@@ -2046,18 +2089,82 @@ mod tests {
         assert_eq!(g.crystals, held, "nothing past the cap");
     }
 
-    #[test]
-    fn multishot_also_pops_the_nearest_short_word() {
+    /// A kill target plus short and long bystanders, for Multishot tests.
+    fn crowded() -> Game {
         let mut g = with_rock("planet");
-        let mut short = g.make_rock(30.0, 12.0, 1.8, "cat".to_string());
-        short.vx = 0.0;
-        g.rocks.push(short);
-        let long = g.make_rock(20.0, 8.0, 2.4, "mountain".to_string());
-        g.rocks.push(long);
+        for (x, y, word) in [
+            (30.0, 12.0, "cat"),
+            (35.0, 6.0, "moon"),
+            (20.0, 8.0, "orbit"),
+        ] {
+            let rock = g.make_rock(x, y, 1.8, word.to_string());
+            g.rocks.push(rock);
+        }
+        g
+    }
+
+    fn remaining(g: &Game) -> Vec<&str> {
+        let mut words: Vec<&str> = g.rocks.iter().map(|r| r.word.as_str()).collect();
+        words.sort();
+        words
+    }
+
+    #[test]
+    fn multishot_pops_one_short_word_and_grows_with_levels() {
+        // Level 1: only the nearest word of 4 letters or fewer ("moon").
+        let mut g = crowded();
         g.upgrades.set(Upgrade::Multishot, 1);
         type_word(&mut g, "planet");
-        let words: Vec<&str> = g.rocks.iter().map(|r| r.word.as_str()).collect();
-        assert_eq!(words, ["mountain"], "only the short word chained");
+        assert_eq!(remaining(&g), ["cat", "orbit"]);
+
+        // Level 1 ignores a five-letter word; level 2 takes it.
+        for (level, expect_left) in [(1u8, 1usize), (2, 0)] {
+            let mut g = with_rock("planet");
+            let rock = g.make_rock(30.0, 12.0, 1.8, "orbit".to_string());
+            g.rocks.push(rock);
+            g.upgrades.set(Upgrade::Multishot, level);
+            type_word(&mut g, "planet");
+            assert_eq!(g.rocks.len(), expect_left, "level {level}");
+        }
+    }
+
+    #[test]
+    fn scattershot_adds_targets_and_needs_multishot() {
+        let mut g = crowded();
+        g.upgrades.set(Upgrade::Multishot, 1);
+        g.upgrades.set(Upgrade::Scattershot, 1);
+        type_word(&mut g, "planet");
+        assert_eq!(remaining(&g), ["orbit"], "two short words popped");
+
+        let mut g = playing();
+        assert!(!g.eligible(Upgrade::Scattershot));
+        g.upgrades.set(Upgrade::Multishot, 1);
+        assert!(g.eligible(Upgrade::Scattershot));
+    }
+
+    #[test]
+    fn focus_slows_only_the_typed_hazard_and_more_per_level() {
+        let slow = |level: u8| -> f32 {
+            let mut g = with_rock("planet");
+            let other = g.make_rock(40.0, 10.0, 1.8, "moon".to_string());
+            g.rocks.push(other);
+            for r in &mut g.rocks {
+                r.vx = 4.0;
+                r.vy = 0.0;
+            }
+            g.upgrades.set(Upgrade::Focus, level);
+            g.type_char('p');
+            let (x0, ox0) = (g.rocks[0].x, g.rocks[1].x);
+            g.integrate_rocks(0.5, true);
+            let moved = g.rocks[0].x - x0;
+            assert!((g.rocks[1].x - ox0 - 2.0).abs() < 1e-3, "others unaffected");
+            moved
+        };
+        let (none, one, two, four) = (slow(0), slow(1), slow(2), slow(4));
+        assert!(
+            one < none && two < one && four < two,
+            "{none} {one} {two} {four}"
+        );
     }
 
     #[test]

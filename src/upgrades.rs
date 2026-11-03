@@ -52,9 +52,10 @@ pub enum Upgrade {
     BigGame,
     Haggler,
     Leech,
+    Scattershot,
 }
 
-pub const COUNT: usize = 15;
+pub const COUNT: usize = 16;
 
 pub struct Def {
     /// Stable id used in save files.
@@ -135,9 +136,9 @@ const DEFS: [Def; COUNT] = [
     def(
         "multishot",
         "MULTISHOT",
-        "Kills also pop the nearest word of 4 or fewer letters.",
+        "Kills also pop the nearest short word.",
         Rarity::Uncommon,
-        3,
+        4,
     ),
     def(
         "ward",
@@ -170,9 +171,9 @@ const DEFS: [Def; COUNT] = [
     def(
         "focus",
         "FOCUS",
-        "Hazards slow by a third while you type.",
+        "The word you are typing slows down.",
         Rarity::Rare,
-        1,
+        4,
     ),
     def(
         "biggame",
@@ -195,6 +196,13 @@ const DEFS: [Def; COUNT] = [
         Rarity::Rare,
         1,
     ),
+    def(
+        "scattershot",
+        "SCATTERSHOT",
+        "Multishot pops more words per kill.",
+        Rarity::Rare,
+        3,
+    ),
 ];
 
 impl Upgrade {
@@ -214,6 +222,7 @@ impl Upgrade {
         Upgrade::BigGame,
         Upgrade::Haggler,
         Upgrade::Leech,
+        Upgrade::Scattershot,
     ];
 
     pub fn def(self) -> &'static Def {
@@ -222,6 +231,36 @@ impl Upgrade {
 
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|u| u.def().key == key)
+    }
+
+    /// Longest word Multishot can pop at `level`.
+    pub fn multishot_letters(level: u8) -> usize {
+        3 + level as usize
+    }
+
+    /// Pace of the typed hazard under Focus at `level` (1.0 means no effect).
+    pub fn focus_pace(level: u8) -> f32 {
+        1.0 / (1.0 + 0.5 * level as f32)
+    }
+
+    /// Card text for the level you would have after buying. Stacking upgrades
+    /// spell out their next step; the rest use the fixed description.
+    pub fn blurb(self, next_level: u8) -> String {
+        let level = next_level.clamp(1, self.def().max);
+        match self {
+            Upgrade::Multishot => format!(
+                "Kills also pop the nearest word of {} letters or fewer.",
+                Self::multishot_letters(level)
+            ),
+            Upgrade::Scattershot => {
+                format!("Multishot pops {} words per kill.", 1 + level)
+            }
+            Upgrade::Focus => format!(
+                "The word you type slows to {}% speed.",
+                (Self::focus_pace(level) * 100.0).round()
+            ),
+            _ => self.def().desc.to_string(),
+        }
     }
 
     /// Crystals needed to buy the next level when `owned` levels are held.
