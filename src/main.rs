@@ -1,15 +1,20 @@
 mod draw;
 mod game;
+mod save;
+mod upgrades;
 mod words;
 
 use std::io::Result;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use game::{
-    Game, Phase, MENU_QUIT, MENU_START, MENU_THEMES, OVER_AGAIN, OVER_QUIT, OVER_THEMES,
-    PAUSE_CONTINUE, PAUSE_QUIT, PAUSE_RESTART,
+    Game, Phase, TitleAction, OVER_AGAIN, OVER_QUIT, OVER_THEMES, PAUSE_CONTINUE, PAUSE_QUIT,
+    PAUSE_RESTART,
 };
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+
+/// How long the window size must hold still before the final repaint.
+const SETTLE: Duration = Duration::from_millis(250);
 
 fn main() -> Result<()> {
     let mut terminal = ratatui::init();
@@ -25,10 +30,27 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         .unwrap_or(1);
     let size = terminal.size()?;
     let mut game = Game::new(size.width, size.height, seed);
+    game.enable_persistence();
     let mut last = Instant::now();
+    let mut seen = size;
+    // When a resize has settled, repaint everything once more.
+    let mut repaint_at: Option<Instant> = None;
 
     loop {
         let size = terminal.size()?;
+        if size != seen {
+            // Resizing (fullscreen in particular) arrives as several quick
+            // steps, and the terminal can wipe cells ratatui believes are
+            // still painted. ratatui only sends changed cells, so force a full
+            // repaint now and again once the size has stopped moving.
+            seen = size;
+            terminal.clear()?;
+            repaint_at = Some(Instant::now() + SETTLE);
+        }
+        if repaint_at.is_some_and(|at| Instant::now() >= at) {
+            terminal.clear()?;
+            repaint_at = None;
+        }
         game.set_screen(size.width, size.height);
         terminal.draw(|frame| draw::draw(frame, &game))?;
 
@@ -37,8 +59,16 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             while event::poll(Duration::from_millis(0))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('l' | 'L'))
+                        {
+                            // Ctrl+L: manual full repaint.
+                            terminal.clear()?;
+                            continue;
+                        }
                         on_key(&mut game, key.code, key.modifiers)
                     }
+                    Event::Resize(..) => repaint_at = Some(Instant::now() + SETTLE),
                     _ => {}
                 }
             }
@@ -77,11 +107,13 @@ fn on_key(game: &mut Game, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Char('k' | 'K' | 'h' | 'H') | KeyCode::Up | KeyCode::Left => {
                 game.menu_move(-1);
             }
-            KeyCode::Enter => match game.menu {
-                MENU_START => game.start(),
-                MENU_THEMES => game.open_themes(),
-                MENU_QUIT => game.quit = true,
-                _ => {}
+            KeyCode::Enter => match game.title_action() {
+                TitleAction::Continue => {
+                    game.continue_saved();
+                }
+                TitleAction::Start => game.start(),
+                TitleAction::Themes => game.open_themes(),
+                TitleAction::Quit => game.quit = true,
             },
             KeyCode::Char('q' | 'Q') => game.quit = true,
             _ => {}
@@ -104,10 +136,10 @@ fn on_key(game: &mut Game, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Enter => match game.menu {
                 PAUSE_CONTINUE => game.resume(),
                 PAUSE_RESTART => game.start(),
-                PAUSE_QUIT => game.return_to_title(),
+                PAUSE_QUIT => game.save_and_quit_to_title(),
                 _ => {}
             },
-            KeyCode::Char('q' | 'Q') => game.return_to_title(),
+            KeyCode::Char('q' | 'Q') => game.save_and_quit_to_title(),
             _ => {}
         },
         Phase::GameOver => match code {
@@ -124,6 +156,20 @@ fn on_key(game: &mut Game, code: KeyCode, mods: KeyModifiers) {
                 _ => {}
             },
             KeyCode::Char('q' | 'Q') => game.quit = true,
+            _ => {}
+        },
+        Phase::Shop => match code {
+            KeyCode::Char('j' | 'J' | 'l' | 'L') | KeyCode::Down | KeyCode::Right => {
+                game.shop_move(1);
+            }
+            KeyCode::Char('k' | 'K' | 'h' | 'H') | KeyCode::Up | KeyCode::Left => {
+                game.shop_move(-1);
+            }
+            KeyCode::Char(c @ '1'..='3') => game.shop_buy(c as usize - '1' as usize),
+            KeyCode::Char('r' | 'R') => game.shop_reroll(),
+            KeyCode::Char('n' | 'N' | ' ') => game.leave_shop(),
+            KeyCode::Enter => game.shop_activate(),
+            KeyCode::Char('q' | 'Q') | KeyCode::Esc => game.save_and_quit_to_title(),
             _ => {}
         },
         Phase::Dying => {}

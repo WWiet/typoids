@@ -1,5 +1,7 @@
 //! Simulation for TYPOIDS. The terminal shell only feeds keys and paints this.
 
+use crate::save::{self, RunSave};
+use crate::upgrades::{Upgrade, Upgrades};
 use crate::words;
 use std::f32::consts::{PI, TAU};
 use std::fs;
@@ -9,11 +11,20 @@ const TURN_SHARPNESS: f32 = 9.0;
 const SHIP_HIT: f32 = 1.35;
 
 pub const MENU_ITEMS: &[&str] = &["START", "THEMES", "QUIT"];
+pub const MENU_ITEMS_SAVED: &[&str] = &["CONTINUE", "NEW RUN", "THEMES", "QUIT"];
 pub const MENU_START: usize = 0;
-pub const MENU_THEMES: usize = 1;
-pub const MENU_QUIT: usize = 2;
 
-pub const PAUSE_ITEMS: &[&str] = &["CONTINUE", "RESTART", "QUIT"];
+/// What the highlighted title entry does. The title list grows a CONTINUE
+/// entry when a run is saved, so key handling asks this instead of an index.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TitleAction {
+    Continue,
+    Start,
+    Themes,
+    Quit,
+}
+
+pub const PAUSE_ITEMS: &[&str] = &["CONTINUE", "RESTART", "SAVE & QUIT"];
 pub const PAUSE_CONTINUE: usize = 0;
 pub const PAUSE_RESTART: usize = 1;
 pub const PAUSE_QUIT: usize = 2;
@@ -22,6 +33,14 @@ pub const OVER_ITEMS: &[&str] = &["PLAY AGAIN", "THEMES", "QUIT"];
 pub const OVER_AGAIN: usize = 0;
 pub const OVER_THEMES: usize = 1;
 pub const OVER_QUIT: usize = 2;
+
+/// Offers per shop, plus a reroll button and a "next wave" button.
+pub const SHOP_SLOTS: usize = 3;
+pub const SHOP_REROLL: usize = SHOP_SLOTS;
+pub const SHOP_GO: usize = SHOP_SLOTS + 1;
+const SHOP_ENTRIES: usize = SHOP_SLOTS + 2;
+const BASE_HEARTS: u32 = 3;
+const REROLL_BASE: u32 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
@@ -67,6 +86,7 @@ pub enum Phase {
     Title,
     Playing,
     Paused,
+    Shop,
     Dying,
     GameOver,
 }
@@ -116,6 +136,25 @@ pub enum Effect {
         max: f32,
         text: String,
     },
+    /// A falling droplet of spilled liquid. It stops at `floor` and soaks in.
+    Drop {
+        x: f32,
+        y: f32,
+        vx: f32,
+        vy: f32,
+        floor: f32,
+        life: f32,
+        max: f32,
+    },
+    /// A puddle that spreads out to `reach` and lingers before fading.
+    Puddle {
+        x: f32,
+        y: f32,
+        w: f32,
+        reach: f32,
+        life: f32,
+        max: f32,
+    },
 }
 
 impl Effect {
@@ -125,7 +164,9 @@ impl Effect {
             | Effect::Shard { life, max, .. }
             | Effect::Laser { life, max, .. }
             | Effect::Ring { life, max, .. }
-            | Effect::Float { life, max, .. } => (*life, *max),
+            | Effect::Float { life, max, .. }
+            | Effect::Drop { life, max, .. }
+            | Effect::Puddle { life, max, .. } => (*life, *max),
         };
         if max <= 0.0 {
             0.0
@@ -151,6 +192,30 @@ pub struct Rock {
     pub hit: f32,
 }
 
+/// A crystal dropped by a destroyed hazard. It drifts out, then flies to the
+/// ship and is collected on arrival.
+#[derive(Clone, Debug)]
+pub struct Gem {
+    pub x: f32,
+    pub y: f32,
+    vx: f32,
+    vy: f32,
+    age: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Offer {
+    pub upgrade: Upgrade,
+    pub sold: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Shop {
+    pub offers: Vec<Offer>,
+    /// Rerolls spent in this shop; each makes the next one dearer.
+    pub rerolls: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Star {
     pub x: f32,
@@ -171,6 +236,14 @@ pub struct Game {
     pub best: u32,
     pub wave: u32,
     pub lives: u32,
+    pub crystals: u32,
+    pub upgrades: Upgrades,
+    pub gems: Vec<Gem>,
+    pub gem_flash: f32,
+    pub shield: u32,
+    pub shop: Option<Shop>,
+    pub shop_sel: usize,
+    pub shop_note: String,
     pub combo: u32,
     pub buffer: String,
     pub target: Option<u32>,
@@ -206,6 +279,14 @@ pub struct Game {
     clear_t: f32,
     exhaust: f32,
     best_dirty: bool,
+    kills: u32,
+    revive_used: bool,
+    last_initial: Option<char>,
+    /// A wrong key was pressed since the last kill (breaks Steady Hands).
+    fumbled: bool,
+    /// Only the real binary writes save files; tests leave this off.
+    persist: bool,
+    pub has_save: bool,
 }
 
 struct Rng(u64);
@@ -297,6 +378,9 @@ pub struct Metrics {
     pub dock_y: u16,
 }
 
+/// Downward pull on spilled droplets, in cells per second squared.
+const DROP_GRAVITY: f32 = 26.0;
+
 pub fn metrics(term_w: u16, term_h: u16) -> Metrics {
     let dock_h = 2;
     let origin_y = 1;
@@ -322,7 +406,15 @@ impl Game {
             score: 0,
             best: load_best(),
             wave: 1,
-            lives: 3,
+            lives: BASE_HEARTS,
+            crystals: 0,
+            upgrades: Upgrades::default(),
+            gems: Vec::new(),
+            gem_flash: 0.0,
+            shield: 0,
+            shop: None,
+            shop_sel: 0,
+            shop_note: String::new(),
             combo: 0,
             buffer: String::new(),
             target: None,
@@ -358,6 +450,12 @@ impl Game {
             clear_t: 0.0,
             exhaust: 0.0,
             best_dirty: false,
+            kills: 0,
+            revive_used: false,
+            last_initial: None,
+            fumbled: false,
+            persist: false,
+            has_save: false,
         };
         game.set_screen(term_w, term_h);
         game.seed_title();
@@ -421,8 +519,23 @@ impl Game {
         match self.phase {
             Phase::Paused => PAUSE_ITEMS,
             Phase::GameOver => OVER_ITEMS,
+            _ if self.has_save => MENU_ITEMS_SAVED,
             _ => MENU_ITEMS,
         }
+    }
+
+    pub fn title_action(&self) -> TitleAction {
+        let offset = self.has_save as usize;
+        match self.menu.checked_sub(offset) {
+            None => TitleAction::Continue,
+            Some(0) => TitleAction::Start,
+            Some(1) => TitleAction::Themes,
+            Some(_) => TitleAction::Quit,
+        }
+    }
+
+    pub fn max_lives(&self) -> u32 {
+        BASE_HEARTS + self.upgrades.level(Upgrade::ExtraHeart) as u32
     }
 
     pub fn pause(&mut self) {
@@ -468,6 +581,7 @@ impl Game {
         self.phase = Phase::Playing;
         self.theme_menu_open = false;
         self.reset_run();
+        self.clear_save();
         self.begin_wave();
     }
 
@@ -486,7 +600,19 @@ impl Game {
         self.buffer.clear();
         self.target = None;
         self.score = 0;
-        self.lives = 3;
+        self.lives = BASE_HEARTS;
+        self.crystals = 0;
+        self.upgrades = Upgrades::default();
+        self.gems.clear();
+        self.gem_flash = 0.0;
+        self.shield = 0;
+        self.shop = None;
+        self.shop_sel = 0;
+        self.shop_note.clear();
+        self.kills = 0;
+        self.revive_used = false;
+        self.last_initial = None;
+        self.fumbled = false;
         self.combo = 0;
         self.combo_left = 0.0;
         self.wave = 1;
@@ -523,6 +649,7 @@ impl Game {
             .any(|r| r.live && r.word.starts_with(&next));
         if !any {
             self.miss = 0.32;
+            self.fumbled = true;
             self.shake = self.shake.max(0.12);
             return;
         }
@@ -560,13 +687,15 @@ impl Game {
 
         match self.phase {
             Phase::Title => self.update_title(dt),
-            Phase::Paused | Phase::GameOver => {}
+            Phase::Paused | Phase::GameOver | Phase::Shop => {}
             Phase::Dying => {
                 self.integrate_rocks(dt, false);
                 self.dying -= dt;
                 if self.dying <= 0.0 {
                     self.phase = Phase::GameOver;
                     self.menu = OVER_AGAIN;
+                    self.gems.clear();
+                    self.clear_save();
                     self.save_best();
                 }
             }
@@ -604,13 +733,16 @@ impl Game {
     }
 
     fn update_play(&mut self, dt: f32) {
+        self.update_gems(dt, self.pending_clear);
         if self.pending_clear {
             self.clear_t -= dt;
             self.integrate_rocks(dt, false);
             if self.clear_t <= 0.0 {
                 self.pending_clear = false;
+                self.crystals += self.gems.len() as u32;
+                self.gems.clear();
                 self.wave += 1;
-                self.begin_wave();
+                self.open_shop(true);
             }
             return;
         }
@@ -643,6 +775,7 @@ impl Game {
     }
 
     fn begin_wave(&mut self) {
+        self.shield = self.upgrades.level(Upgrade::Ward) as u32;
         self.budget = 5 + self.wave * 2;
         self.spawn_timer = 0.35;
         self.pending_clear = false;
@@ -658,12 +791,16 @@ impl Game {
     fn integrate_rocks(&mut self, dt: f32, collide: bool) {
         let (sx, sy) = self.ship_pos();
         let mut hits = Vec::new();
+        let mut pace = 1.0 - 0.1 * self.upgrades.level(Upgrade::SlowTide) as f32;
+        if collide && self.upgrades.has(Upgrade::Focus) && !self.buffer.is_empty() {
+            pace *= 0.67;
+        }
         for rock in &mut self.rocks {
             if !rock.live {
                 continue;
             }
-            rock.x += rock.vx * dt;
-            rock.y += rock.vy * dt;
+            rock.x += rock.vx * dt * pace;
+            rock.y += rock.vy * dt * pace;
             rock.rot += rock.spin * dt;
             rock.hit = (rock.hit - dt).max(0.0);
             if !collide || self.phase != Phase::Playing {
@@ -810,6 +947,7 @@ impl Game {
         }
         if kill {
             self.detonate(id, &word, radius, tx, ty);
+            self.chain_kills(tx, ty);
         }
     }
 
@@ -825,8 +963,22 @@ impl Game {
 
     fn detonate(&mut self, id: u32, word: &str, radius: f32, x: f32, y: f32) {
         self.combo = self.combo.saturating_add(1);
-        self.combo_left = 3.4;
-        let pts = word.len() as u32 * 50 * self.combo;
+        self.combo_left = 3.4 + 1.5 * self.upgrades.level(Upgrade::LongFuse) as f32;
+        let initial = word.chars().next();
+        let echo = self.upgrades.has(Upgrade::Alliteration)
+            && initial.is_some()
+            && initial == self.last_initial;
+        self.last_initial = initial;
+        let big = self.upgrades.has(Upgrade::BigGame) && word.len() >= 7;
+        let bonus = 1 + echo as u32 + big as u32;
+        let clean = !self.fumbled;
+        self.fumbled = false;
+        let steady = if clean {
+            self.upgrades.level(Upgrade::SteadyHands) as u32
+        } else {
+            0
+        };
+        let pts = word.len() as u32 * 50 * self.combo * bonus * (100 + 25 * steady) / 100;
         self.score += pts;
         if self.score > self.best {
             self.best = self.score;
@@ -844,15 +996,107 @@ impl Game {
                 format!("+{pts}")
             },
         });
+        let crystals = 1
+            + (word.len() >= 6) as u32
+            + self.upgrades.level(Upgrade::Prospector) as u32
+            + echo as u32
+            + steady
+            + if big { 2 } else { 0 };
+        self.drop_gems(x, y, crystals);
+        self.kills += 1;
+        if self.upgrades.has(Upgrade::Leech)
+            && self.kills / 12 != (self.kills - 1) / 12
+            && self.lives < self.max_lives()
+        {
+            self.lives += 1;
+        }
         self.burst(x, y, radius);
         self.rocks.retain(|r| r.id != id);
         self.buffer.clear();
         self.target = None;
     }
 
-    /// One explosion shape for every theme: a ring and a few shards. Themes
-    /// differ only in how `draw` colors and squashes the ring.
+    /// Multishot: a kill also pops the nearest short-worded hazards.
+    fn chain_kills(&mut self, x: f32, y: f32) {
+        let (sx, sy) = self.ship_center();
+        for _ in 0..self.upgrades.level(Upgrade::Multishot) {
+            let pick = self
+                .rocks
+                .iter()
+                .filter(|r| r.live && r.word.len() <= 4)
+                .min_by(|a, b| {
+                    let da = (a.x - sx).powi(2) + (a.y - sy).powi(2);
+                    let db = (b.x - sx).powi(2) + (b.y - sy).powi(2);
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|r| (r.id, r.word.clone(), r.radius, r.x, r.y));
+            let Some((id, word, radius, rx, ry)) = pick else {
+                break;
+            };
+            self.effects.push(Effect::Laser {
+                x0: x,
+                y0: y,
+                x1: rx,
+                y1: ry,
+                life: 0.3,
+                max: 0.3,
+            });
+            self.detonate(id, &word, radius, rx, ry);
+        }
+    }
+
+    fn drop_gems(&mut self, x: f32, y: f32, count: u32) {
+        for _ in 0..count {
+            self.gems.push(Gem {
+                x,
+                y,
+                vx: self.rng.range(-6.0, 6.0),
+                vy: self.rng.range(-5.0, 2.0),
+                age: 0.0,
+            });
+        }
+    }
+
+    /// Gems drift out, then home in on the ship. `rush` skips the drift (used
+    /// once a wave is cleared so nothing is left behind).
+    fn update_gems(&mut self, dt: f32, rush: bool) {
+        let (sx, sy) = self.ship_pos();
+        let (w, h) = (self.play_w, self.play_h);
+        let delay = if rush { 0.0 } else { 0.45 };
+        let before = self.gems.len();
+        self.gems.retain_mut(|g| {
+            g.age += dt;
+            if g.age < delay {
+                g.x = (g.x + g.vx * dt).clamp(0.0, w - 1.0);
+                g.y = (g.y + g.vy * dt).clamp(0.0, h - 1.0);
+                g.vx *= 1.0 - dt * 3.0;
+                g.vy *= 1.0 - dt * 3.0;
+                return true;
+            }
+            let (dx, dy) = (sx - g.x, sy - g.y);
+            let dist = (dx * dx + dy * dy).sqrt().max(0.01);
+            let step = (12.0 + (g.age - delay) * 70.0).min(80.0) * dt;
+            if dist <= step + 0.9 {
+                return false;
+            }
+            g.x += dx / dist * step;
+            g.y += dy / dist * step;
+            true
+        });
+        let got = before - self.gems.len();
+        if got > 0 {
+            self.crystals += got as u32;
+            self.gem_flash = 0.3;
+        }
+    }
+
+    /// Hazards break apart in one of two ways. Space and Underwater pop in a
+    /// ring and shards; Jungle and Cat Cafe spill their contents.
     fn burst(&mut self, x: f32, y: f32, radius: f32) {
+        if matches!(self.theme, Theme::Jungle | Theme::CatCafe) {
+            self.pour(x, y, radius);
+            return;
+        }
         self.effects.push(Effect::Ring {
             x,
             y,
@@ -861,8 +1105,12 @@ impl Game {
             life: 0.42,
             max: 0.42,
         });
-        for i in 0..6 {
-            let a = (i as f32 / 6.0) * TAU;
+        self.shards(x, y, 6);
+    }
+
+    fn shards(&mut self, x: f32, y: f32, count: usize) {
+        for i in 0..count {
+            let a = (i as f32 / count as f32) * TAU;
             self.effects.push(Effect::Shard {
                 x,
                 y,
@@ -877,6 +1125,33 @@ impl Game {
         }
     }
 
+    /// Liquid pours out: droplets arc out and fall, then a puddle spreads
+    /// where the hazard sat and lingers.
+    fn pour(&mut self, x: f32, y: f32, radius: f32) {
+        let floor = (y + radius * 0.5).min(self.play_h - 1.0).max(y);
+        for _ in 0..16 {
+            let life = self.rng.range(0.9, 1.6);
+            self.effects.push(Effect::Drop {
+                x: x + self.rng.range(-radius * 0.5, radius * 0.5),
+                y: y + self.rng.range(-radius * 0.4, 0.0),
+                vx: self.rng.range(-5.0, 5.0),
+                vy: self.rng.range(-8.0, -1.0),
+                floor,
+                life,
+                max: life,
+            });
+        }
+        self.effects.push(Effect::Puddle {
+            x,
+            y: floor,
+            w: 0.0,
+            reach: radius * 2.2,
+            life: 2.4,
+            max: 2.4,
+        });
+        self.shards(x, y, 3);
+    }
+
     fn collide(&mut self, id: u32) {
         // Invulnerability blocks hull damage. It must not also destroy rocks or
         // clear the typing buffer, otherwise grazing the ship during i-frames
@@ -888,7 +1163,23 @@ impl Game {
             return;
         };
         let (x, y, radius) = (rock.x, rock.y, rock.radius);
+        if self.shield > 0 {
+            self.shield -= 1;
+            self.invuln = 0.9;
+            self.shake = 0.3;
+            self.burst(x, y, radius);
+            self.rocks.retain(|r| r.id != id);
+            self.buffer.clear();
+            self.target = None;
+            return;
+        }
         self.lives = self.lives.saturating_sub(1);
+        if self.lives == 0 && self.upgrades.has(Upgrade::SecondWind) && !self.revive_used {
+            self.revive_used = true;
+            self.lives = 1;
+            self.banner = "SECOND WIND".to_string();
+            self.banner_t = 1.2;
+        }
         self.invuln = 1.45;
         self.hurt = 0.5;
         self.shake = 0.45;
@@ -911,6 +1202,239 @@ impl Game {
                 Theme::CatCafe => "CAT NAPPING".to_string(),
             };
             self.banner_t = 0.95;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn open_shop_for_test(&mut self) {
+        self.open_shop(false);
+    }
+
+    pub fn shop_move(&mut self, delta: isize) {
+        self.shop_sel = (self.shop_sel as isize + delta).rem_euclid(SHOP_ENTRIES as isize) as usize;
+    }
+
+    /// Enter the shop. `pay_interest` is false when resuming a saved shop.
+    fn open_shop(&mut self, pay_interest: bool) {
+        self.phase = Phase::Shop;
+        self.buffer.clear();
+        self.target = None;
+        self.shop_note.clear();
+        if pay_interest && self.upgrades.has(Upgrade::Interest) {
+            let gain = (self.crystals / 5).min(5);
+            self.crystals += gain;
+            if gain > 0 {
+                self.shop_note = format!("Interest paid {gain} crystals.");
+            }
+        }
+        let offers = self.roll_offers();
+        self.shop = Some(Shop { offers, rerolls: 0 });
+        self.shop_sel = 0;
+        self.autosave(true);
+    }
+
+    fn eligible(&self, up: Upgrade) -> bool {
+        match up {
+            Upgrade::PatchKit => self.lives < self.max_lives(),
+            _ => !self.upgrades.maxed(up),
+        }
+    }
+
+    fn roll_offers(&mut self) -> Vec<Offer> {
+        let mut pool: Vec<Upgrade> = Upgrade::ALL
+            .into_iter()
+            .filter(|&u| self.eligible(u))
+            .collect();
+        let mut offers = Vec::new();
+        while offers.len() < SHOP_SLOTS && !pool.is_empty() {
+            let total: f32 = pool.iter().map(|u| u.def().rarity.weight()).sum();
+            let mut roll = self.rng.f32() * total;
+            let mut pick = pool.len() - 1;
+            for (i, u) in pool.iter().enumerate() {
+                roll -= u.def().rarity.weight();
+                if roll <= 0.0 {
+                    pick = i;
+                    break;
+                }
+            }
+            offers.push(Offer {
+                upgrade: pool.remove(pick),
+                sold: false,
+            });
+        }
+        offers
+    }
+
+    pub fn upgrade_cost(&self, up: Upgrade) -> u32 {
+        up.cost(self.upgrades.level(up))
+    }
+
+    pub fn reroll_cost(&self) -> u32 {
+        let spent = self.shop.as_ref().map_or(0, |s| s.rerolls);
+        let free = self.upgrades.has(Upgrade::Haggler) as u32;
+        if free == 1 && spent == 0 {
+            0
+        } else {
+            REROLL_BASE + spent.saturating_sub(free)
+        }
+    }
+
+    pub fn shop_buy(&mut self, slot: usize) {
+        if self.phase != Phase::Shop {
+            return;
+        }
+        let Some(offer) = self.shop.as_ref().and_then(|s| s.offers.get(slot)) else {
+            return;
+        };
+        let up = offer.upgrade;
+        if offer.sold {
+            self.shop_note = "Already bought.".to_string();
+            return;
+        }
+        let cost = self.upgrade_cost(up);
+        if self.crystals < cost {
+            self.shop_note = format!("Need {} more crystals.", cost - self.crystals);
+            return;
+        }
+        self.crystals -= cost;
+        match up {
+            Upgrade::PatchKit => self.lives = (self.lives + 1).min(self.max_lives()),
+            Upgrade::ExtraHeart => self.lives += 1,
+            _ => {}
+        }
+        self.upgrades.add(up);
+        // Stackable upgrades stay on the shelf until they hit their cap.
+        let restock = !up.def().consumable && !self.upgrades.maxed(up);
+        if let Some(offer) = self.shop.as_mut().and_then(|s| s.offers.get_mut(slot)) {
+            offer.sold = !restock;
+        }
+        self.shop_note = if self
+            .shop
+            .as_ref()
+            .is_some_and(|s| s.offers.iter().all(|o| o.sold))
+        {
+            format!("Bought {}. Sold out: reroll or head on.", up.def().name)
+        } else {
+            format!("Bought {}.", up.def().name)
+        };
+        self.autosave(true);
+    }
+
+    pub fn shop_reroll(&mut self) {
+        if self.phase != Phase::Shop {
+            return;
+        }
+        let cost = self.reroll_cost();
+        if self.crystals < cost {
+            self.shop_note = format!("Need {} more crystals.", cost - self.crystals);
+            return;
+        }
+        self.crystals -= cost;
+        let offers = self.roll_offers();
+        if let Some(shop) = self.shop.as_mut() {
+            shop.rerolls += 1;
+            shop.offers = offers;
+        }
+        self.shop_note = "Rerolled.".to_string();
+        self.autosave(true);
+    }
+
+    pub fn shop_activate(&mut self) {
+        match self.shop_sel {
+            SHOP_REROLL => self.shop_reroll(),
+            SHOP_GO => self.leave_shop(),
+            slot => self.shop_buy(slot),
+        }
+    }
+
+    pub fn leave_shop(&mut self) {
+        if self.phase != Phase::Shop {
+            return;
+        }
+        self.shop = None;
+        self.phase = Phase::Playing;
+        self.begin_wave();
+    }
+
+    /// Turn on save files. Only the real binary calls this.
+    pub fn enable_persistence(&mut self) {
+        self.persist = true;
+        self.has_save = save::path().is_some_and(|p| p.exists());
+    }
+
+    fn snapshot(&self, in_shop: bool) -> RunSave {
+        RunSave {
+            wave: self.wave,
+            score: self.score,
+            lives: self.lives,
+            crystals: self.crystals,
+            kills: self.kills,
+            revive_used: self.revive_used,
+            in_shop,
+            upgrades: self.upgrades,
+        }
+    }
+
+    fn autosave(&mut self, in_shop: bool) {
+        if !self.persist {
+            return;
+        }
+        if let Some(path) = save::path() {
+            self.has_save = fs::write(path, save::encode(&self.snapshot(in_shop))).is_ok();
+        }
+    }
+
+    fn clear_save(&mut self) {
+        if self.persist {
+            if let Some(path) = save::path() {
+                let _ = fs::remove_file(path);
+            }
+        }
+        self.has_save = false;
+    }
+
+    /// Save the run (at the start of the current wave, or in the shop) and go
+    /// back to the title screen.
+    pub fn save_and_quit_to_title(&mut self) {
+        if matches!(self.phase, Phase::Playing | Phase::Paused | Phase::Shop) {
+            let in_shop = self.phase == Phase::Shop;
+            self.autosave(in_shop);
+        }
+        self.return_to_title();
+    }
+
+    /// Resume the saved run from disk. Returns false if there is none.
+    pub fn continue_saved(&mut self) -> bool {
+        let run = save::path()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|text| save::decode(&text));
+        match run {
+            Some(run) => {
+                self.load_run(run);
+                true
+            }
+            None => {
+                self.has_save = false;
+                false
+            }
+        }
+    }
+
+    pub fn load_run(&mut self, run: RunSave) {
+        self.theme_menu_open = false;
+        self.reset_run();
+        self.wave = run.wave;
+        self.score = run.score;
+        self.crystals = run.crystals;
+        self.kills = run.kills;
+        self.revive_used = run.revive_used;
+        self.upgrades = run.upgrades;
+        self.lives = run.lives.min(self.max_lives());
+        if run.in_shop {
+            self.open_shop(false);
+        } else {
+            self.phase = Phase::Playing;
+            self.begin_wave();
         }
     }
 
@@ -1124,6 +1648,31 @@ impl Game {
                     *y -= 6.0 * dt;
                     *life -= dt;
                 }
+                Effect::Drop {
+                    x,
+                    y,
+                    vx,
+                    vy,
+                    floor,
+                    life,
+                    ..
+                } => {
+                    if *y < *floor {
+                        *vy += DROP_GRAVITY * dt;
+                        *x += *vx * dt;
+                        *y = (*y + *vy * dt).min(*floor);
+                        *vx *= 1.0 - dt * 1.2;
+                        *life -= dt;
+                    } else {
+                        // Landed: soak in quickly.
+                        *vy = 0.0;
+                        *life -= dt * 4.0;
+                    }
+                }
+                Effect::Puddle { w, reach, life, .. } => {
+                    *w += (*reach - *w) * (dt * 5.0).min(1.0);
+                    *life -= dt;
+                }
             }
         }
         self.effects.retain(|e| match e {
@@ -1131,7 +1680,9 @@ impl Game {
             | Effect::Shard { life, .. }
             | Effect::Laser { life, .. }
             | Effect::Ring { life, .. }
-            | Effect::Float { life, .. } => *life > 0.0,
+            | Effect::Float { life, .. }
+            | Effect::Drop { life, .. }
+            | Effect::Puddle { life, .. } => *life > 0.0,
         });
     }
 
@@ -1141,6 +1692,7 @@ impl Game {
         self.hurt = (self.hurt - dt).max(0.0);
         self.invuln = (self.invuln - dt).max(0.0);
         self.banner_t = (self.banner_t - dt).max(0.0);
+        self.gem_flash = (self.gem_flash - dt).max(0.0);
         if self.combo > 0 && self.phase == Phase::Playing {
             self.combo_left -= dt;
             if self.combo_left <= 0.0 {
@@ -1274,22 +1826,317 @@ mod tests {
     }
 
     #[test]
+    fn jungle_and_cat_hazards_pour_and_linger() {
+        for theme in [Theme::Jungle, Theme::CatCafe] {
+            let mut g = playing();
+            g.theme = theme;
+            g.burst(50.0, 20.0, 2.0);
+            let has = |g: &Game, f: fn(&Effect) -> bool| g.effects.iter().any(f);
+            assert!(has(&g, |e| matches!(e, Effect::Drop { .. })), "{theme:?}");
+            assert!(has(&g, |e| matches!(e, Effect::Puddle { .. })), "{theme:?}");
+            assert!(!has(&g, |e| matches!(e, Effect::Ring { .. })), "{theme:?}");
+            // Droplets are gone quickly; the puddle is still there after 1.5s.
+            for _ in 0..90 {
+                g.update_effects(1.0 / 60.0);
+            }
+            assert!(!has(&g, |e| matches!(e, Effect::Drop { .. })), "{theme:?}");
+            assert!(has(&g, |e| matches!(e, Effect::Puddle { .. })), "{theme:?}");
+            // ...and it eventually soaks away.
+            for _ in 0..120 {
+                g.update_effects(1.0 / 60.0);
+            }
+            assert!(
+                !has(&g, |e| matches!(e, Effect::Puddle { .. })),
+                "{theme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn space_and_underwater_hazards_still_pop() {
+        for theme in [Theme::Space, Theme::Underwater] {
+            let mut g = playing();
+            g.theme = theme;
+            g.burst(50.0, 20.0, 2.0);
+            assert!(g.effects.iter().any(|e| matches!(e, Effect::Ring { .. })));
+            assert!(!g.effects.iter().any(|e| matches!(e, Effect::Puddle { .. })));
+        }
+    }
+
+    #[test]
     fn menu_wraps_across_three_items() {
         let mut g = Game::new(100, 40, 42);
         assert_eq!(g.menu, MENU_START);
         assert_eq!(MENU_ITEMS.len(), 3);
-        g.menu_move(1);
-        assert_eq!(g.menu, MENU_THEMES);
-        g.menu_move(1);
-        assert_eq!(g.menu, MENU_QUIT);
-        g.menu_move(1);
-        assert_eq!(g.menu, MENU_START);
+        let actions: Vec<TitleAction> = (0..3)
+            .map(|_| {
+                let a = g.title_action();
+                g.menu_move(1);
+                a
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [TitleAction::Start, TitleAction::Themes, TitleAction::Quit]
+        );
+        assert_eq!(g.menu, MENU_START, "wraps back to the top");
         g.menu_move(-1);
-        assert_eq!(g.menu, MENU_QUIT);
-        g.menu_move(-1);
-        assert_eq!(g.menu, MENU_THEMES);
-        g.menu_move(-1);
-        assert_eq!(g.menu, MENU_START);
+        assert_eq!(g.title_action(), TitleAction::Quit);
+    }
+
+    #[test]
+    fn a_saved_run_adds_continue_to_the_title() {
+        let mut g = Game::new(100, 40, 42);
+        g.has_save = true;
+        assert_eq!(g.menu_items(), MENU_ITEMS_SAVED);
+        assert_eq!(g.title_action(), TitleAction::Continue);
+        g.menu_move(1);
+        assert_eq!(g.title_action(), TitleAction::Start);
+    }
+
+    /// A game mid-wave with `n` crystals and one locked-in rock to kill.
+    fn with_rock(word: &str) -> Game {
+        let mut g = playing();
+        g.budget = 5;
+        let rock = g.make_rock(60.0, 10.0, 2.0, word.to_string());
+        g.rocks.push(rock);
+        g
+    }
+
+    fn type_word(g: &mut Game, text: &str) {
+        for c in text.chars() {
+            g.type_char(c);
+        }
+    }
+
+    #[test]
+    fn kills_drop_crystals_that_fly_to_the_ship() {
+        let mut g = with_rock("star");
+        type_word(&mut g, "star");
+        assert!(g.rocks.is_empty());
+        assert!(!g.gems.is_empty(), "a kill drops gems");
+        assert_eq!(g.crystals, 0, "not collected yet");
+        for _ in 0..180 {
+            g.update(1.0 / 60.0);
+            if g.gems.is_empty() {
+                break;
+            }
+        }
+        assert!(g.gems.is_empty());
+        assert!(g.crystals >= 1);
+    }
+
+    #[test]
+    fn clearing_a_wave_opens_the_shop_with_three_offers() {
+        let mut g = playing();
+        g.budget = 0;
+        g.wave = 1;
+        for _ in 0..400 {
+            g.update(1.0 / 60.0);
+            if g.phase == Phase::Shop {
+                break;
+            }
+        }
+        assert_eq!(g.phase, Phase::Shop);
+        assert_eq!(g.wave, 2);
+        let shop = g.shop.as_ref().unwrap();
+        assert_eq!(shop.offers.len(), SHOP_SLOTS);
+        let mut ids: Vec<_> = shop.offers.iter().map(|o| o.upgrade as usize).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), SHOP_SLOTS, "offers are distinct");
+        g.leave_shop();
+        assert_eq!(g.phase, Phase::Playing);
+        assert!(g.shop.is_none());
+    }
+
+    #[test]
+    fn buying_spends_crystals_and_applies_the_upgrade() {
+        let mut g = playing();
+        g.open_shop(false);
+        g.shop.as_mut().unwrap().offers[0] = Offer {
+            upgrade: Upgrade::ExtraHeart,
+            sold: false,
+        };
+        g.crystals = 3;
+        g.shop_buy(0);
+        assert_eq!(g.crystals, 3, "too poor");
+        assert!(g.shop_note.contains("Need"));
+        g.crystals = 40;
+        g.shop_buy(0);
+        assert_eq!(g.crystals, 40 - Upgrade::ExtraHeart.cost(0));
+        assert_eq!(g.max_lives(), 4);
+        assert_eq!(g.lives, 4);
+        // Stackable: still for sale, at a higher price.
+        assert!(!g.shop.as_ref().unwrap().offers[0].sold);
+        assert_eq!(
+            g.upgrade_cost(Upgrade::ExtraHeart),
+            Upgrade::ExtraHeart.cost(1)
+        );
+
+        // One-offs sell out.
+        g.shop.as_mut().unwrap().offers[1] = Offer {
+            upgrade: Upgrade::SecondWind,
+            sold: false,
+        };
+        g.shop_buy(1);
+        let before = g.crystals;
+        g.shop_buy(1);
+        assert_eq!(g.crystals, before, "sold cards cannot be bought twice");
+    }
+
+    #[test]
+    fn rerolling_costs_more_each_time_and_haggler_gives_one_free() {
+        let mut g = playing();
+        g.open_shop(false);
+        g.crystals = 50;
+        assert_eq!(g.reroll_cost(), REROLL_BASE);
+        g.shop_reroll();
+        assert_eq!(g.crystals, 50 - REROLL_BASE);
+        assert_eq!(g.reroll_cost(), REROLL_BASE + 1);
+
+        let mut h = playing();
+        h.upgrades.set(Upgrade::Haggler, 1);
+        h.open_shop(false);
+        h.crystals = 50;
+        assert_eq!(h.reroll_cost(), 0);
+        h.shop_reroll();
+        assert_eq!(h.crystals, 50);
+        assert_eq!(h.reroll_cost(), REROLL_BASE);
+    }
+
+    #[test]
+    fn steady_hands_rewards_clean_words_only() {
+        let mut plain = with_rock("planet");
+        type_word(&mut plain, "planet");
+        let (base_score, base_gems) = (plain.score, plain.gems.len());
+
+        let mut clean = with_rock("planet");
+        clean.upgrades.set(Upgrade::SteadyHands, 2);
+        type_word(&mut clean, "planet");
+        assert_eq!(clean.score, base_score * 150 / 100);
+        assert_eq!(clean.gems.len(), base_gems + 2);
+
+        let mut sloppy = with_rock("planet");
+        sloppy.upgrades.set(Upgrade::SteadyHands, 2);
+        type_word(&mut sloppy, "pz");
+        type_word(&mut sloppy, "lanet");
+        assert_eq!(sloppy.score, base_score, "a slip forfeits the bonus");
+        assert_eq!(sloppy.gems.len(), base_gems);
+    }
+
+    #[test]
+    fn stackable_upgrades_stay_for_sale_until_maxed() {
+        let mut g = playing();
+        g.open_shop(false);
+        g.crystals = 500;
+        g.shop.as_mut().unwrap().offers[0] = Offer {
+            upgrade: Upgrade::SlowTide,
+            sold: false,
+        };
+        let cap = Upgrade::SlowTide.def().max;
+        for level in 1..=cap {
+            g.shop_buy(0);
+            assert_eq!(g.upgrades.level(Upgrade::SlowTide), level);
+            let sold = g.shop.as_ref().unwrap().offers[0].sold;
+            assert_eq!(sold, level == cap, "level {level}");
+        }
+        let held = g.crystals;
+        g.shop_buy(0);
+        assert_eq!(g.crystals, held, "nothing past the cap");
+    }
+
+    #[test]
+    fn multishot_also_pops_the_nearest_short_word() {
+        let mut g = with_rock("planet");
+        let mut short = g.make_rock(30.0, 12.0, 1.8, "cat".to_string());
+        short.vx = 0.0;
+        g.rocks.push(short);
+        let long = g.make_rock(20.0, 8.0, 2.4, "mountain".to_string());
+        g.rocks.push(long);
+        g.upgrades.set(Upgrade::Multishot, 1);
+        type_word(&mut g, "planet");
+        let words: Vec<&str> = g.rocks.iter().map(|r| r.word.as_str()).collect();
+        assert_eq!(words, ["mountain"], "only the short word chained");
+    }
+
+    #[test]
+    fn ward_absorbs_one_hit_per_wave() {
+        let mut g = playing();
+        g.upgrades.set(Upgrade::Ward, 1);
+        g.begin_wave();
+        assert_eq!(g.shield, 1);
+        let (sx, sy) = g.ship_pos();
+        let mut rock = g.make_rock(sx, sy, 2.0, "zzz".to_string());
+        rock.vx = 0.0;
+        rock.vy = 0.0;
+        let id = rock.id;
+        g.rocks = vec![rock];
+        g.collide(id);
+        assert_eq!(g.lives, BASE_HEARTS, "shield soaked the hit");
+        assert_eq!(g.shield, 0);
+    }
+
+    #[test]
+    fn second_wind_survives_one_fatal_hit() {
+        let mut g = playing();
+        g.upgrades.set(Upgrade::SecondWind, 1);
+        g.lives = 1;
+        let (sx, sy) = g.ship_pos();
+        let rock = g.make_rock(sx, sy, 2.0, "zzz".to_string());
+        let id = rock.id;
+        g.rocks = vec![rock];
+        g.collide(id);
+        assert_eq!(g.phase, Phase::Playing);
+        assert_eq!(g.lives, 1);
+        g.invuln = 0.0;
+        let rock = g.make_rock(sx, sy, 2.0, "yyy".to_string());
+        let id = rock.id;
+        g.rocks = vec![rock];
+        g.collide(id);
+        assert_eq!(g.phase, Phase::Dying, "only once per run");
+    }
+
+    #[test]
+    fn alliteration_doubles_score_for_repeated_initials() {
+        let mut plain = with_rock("star");
+        type_word(&mut plain, "star");
+        let base = plain.score;
+
+        let mut g = with_rock("star");
+        g.upgrades.set(Upgrade::Alliteration, 1);
+        g.last_initial = Some('s');
+        type_word(&mut g, "star");
+        assert_eq!(g.score, base * 2);
+    }
+
+    #[test]
+    fn a_saved_run_resumes_in_the_shop() {
+        let mut g = playing();
+        g.wave = 4;
+        g.score = 900;
+        g.crystals = 12;
+        g.lives = 2;
+        g.upgrades.set(Upgrade::Leech, 1);
+        let run = g.snapshot(true);
+        let mut fresh = Game::new(100, 40, 7);
+        fresh.load_run(run);
+        assert_eq!(fresh.phase, Phase::Shop);
+        assert_eq!(fresh.wave, 4);
+        assert_eq!(fresh.score, 900);
+        assert_eq!(fresh.crystals, 12);
+        assert_eq!(fresh.lives, 2);
+        assert!(fresh.upgrades.has(Upgrade::Leech));
+    }
+
+    #[test]
+    fn starting_a_new_run_drops_old_upgrades() {
+        let mut g = playing();
+        g.upgrades.set(Upgrade::Prospector, 3);
+        g.crystals = 99;
+        g.start();
+        assert_eq!(g.crystals, 0);
+        assert!(!g.upgrades.has(Upgrade::Prospector));
     }
 
     #[test]

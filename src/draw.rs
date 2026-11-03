@@ -2,9 +2,10 @@
 //! braille line art; words sit on top in plain cells so they stay readable.
 
 use crate::game::{
-    cat_local, metrics, rotate, spaceship_local, submarine_local, Effect, Game, Phase, Theme,
-    MENU_ITEMS,
+    cat_local, metrics, rotate, spaceship_local, submarine_local, Effect, Game, Phase, Rock, Theme,
+    SHOP_GO, SHOP_REROLL, SHOP_SLOTS,
 };
+use crate::upgrades::Rarity;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
@@ -27,6 +28,10 @@ struct Palette {
     faint: Color,
     /// Backing tone behind word chips.
     chip: Color,
+    /// Spilled liquid: coffee, coconut milk.
+    liquid: Color,
+    /// Crystals, the currency dropped by hazards.
+    gem: Color,
 }
 
 const SPACE: Palette = Palette {
@@ -44,6 +49,8 @@ const SPACE: Palette = Palette {
     dead: Color::Rgb(40, 52, 44),
     faint: Color::Rgb(62, 84, 72),
     chip: Color::Rgb(14, 22, 20),
+    liquid: Color::Rgb(255, 156, 72),
+    gem: Color::Rgb(120, 220, 255),
 };
 
 const UNDERWATER: Palette = Palette {
@@ -61,6 +68,8 @@ const UNDERWATER: Palette = Palette {
     dead: Color::Rgb(24, 48, 60),
     faint: Color::Rgb(52, 104, 122),
     chip: Color::Rgb(6, 26, 38),
+    liquid: Color::Rgb(96, 224, 255),
+    gem: Color::Rgb(255, 128, 196),
 };
 
 const JUNGLE: Palette = Palette {
@@ -78,6 +87,8 @@ const JUNGLE: Palette = Palette {
     dead: Color::Rgb(42, 34, 24),
     faint: Color::Rgb(72, 112, 70),
     chip: Color::Rgb(12, 30, 18),
+    liquid: Color::Rgb(238, 232, 204),
+    gem: Color::Rgb(255, 110, 140),
 };
 
 const CAT_CAFE: Palette = Palette {
@@ -95,6 +106,8 @@ const CAT_CAFE: Palette = Palette {
     dead: Color::Rgb(46, 32, 24),
     faint: Color::Rgb(92, 72, 56),
     chip: Color::Rgb(40, 28, 20),
+    liquid: Color::Rgb(176, 112, 62),
+    gem: Color::Rgb(150, 190, 255),
 };
 
 fn palette(theme: Theme) -> &'static Palette {
@@ -309,6 +322,176 @@ fn draw_jungle_particles(
     }
 }
 
+/// Terminal cells are about twice as tall as wide, so hazard art squashes its
+/// local y by this much (and widens x a little) to look physically round.
+const CELL_Y: f32 = 0.625;
+const CELL_X: f32 = 1.25;
+
+/// Points on an ellipse, in unit coordinates scaled by the caller.
+fn ellipse(cx: f32, cy: f32, rx: f32, ry: f32, n: usize) -> Vec<(f32, f32)> {
+    (0..n)
+        .map(|i| {
+            let a = i as f32 / n as f32 * TAU;
+            (cx + a.cos() * rx, cy + a.sin() * ry)
+        })
+        .collect()
+}
+
+/// Connect points (given in the hazard's local frame, in units of its radius)
+/// with braille lines.
+fn ink_path(
+    ink: &mut InkLayer,
+    to_px: &impl Fn(f32, f32) -> (f32, f32),
+    frame: (&Rock, f32),
+    pts: &[(f32, f32)],
+    closed: bool,
+    style: (u8, Color),
+) {
+    let (rock, rot) = frame;
+    let world: Vec<(f32, f32)> = pts
+        .iter()
+        .map(|(lx, ly)| {
+            let (x, y) = rotate(lx * rock.radius, ly * rock.radius, rot);
+            let (x, y) = (x * CELL_X, y * CELL_Y);
+            to_px(rock.x + x, rock.y + y)
+        })
+        .collect();
+    let last = if closed { world.len() } else { world.len() - 1 };
+    for i in 0..last {
+        let (a, b) = (world[i], world[(i + 1) % world.len()]);
+        ink.line(a.0, a.1, b.0, b.1, style.0, style.1);
+    }
+}
+
+/// A coconut: round, with a hairy husk, a highlight, and three pores.
+fn draw_coconut(
+    ink: &mut InkLayer,
+    to_px: &impl Fn(f32, f32) -> (f32, f32),
+    rock: &Rock,
+    style: (u8, Color),
+    pal: &Palette,
+) {
+    let (pri, col) = style;
+    ink_path(
+        ink,
+        to_px,
+        (rock, 0.0),
+        &ellipse(0.0, 0.0, 0.92, 0.92, 22),
+        true,
+        style,
+    );
+    // Short husk fibers that turn with the nut.
+    for i in 0..14 {
+        let a = rock.rot + i as f32 / 14.0 * TAU;
+        let len = 0.1 + ((i * 7) % 5) as f32 * 0.04;
+        let inner = (a.cos() * 0.9, a.sin() * 0.9);
+        let outer = (a.cos() * (0.9 + len), a.sin() * (0.9 + len));
+        ink_path(
+            ink,
+            to_px,
+            (rock, 0.0),
+            &[inner, outer],
+            false,
+            (pri, fade(col, 0.75)),
+        );
+    }
+    // Fixed highlight, so the light stays put while the nut spins.
+    let arc: Vec<(f32, f32)> = (0..5)
+        .map(|i| {
+            let a = -2.5 + i as f32 * 0.2;
+            (a.cos() * 0.66, a.sin() * 0.66)
+        })
+        .collect();
+    ink_path(
+        ink,
+        to_px,
+        (rock, 0.0),
+        &arc,
+        false,
+        (pri + 2, fade(pal.hot, 0.55)),
+    );
+    // Three pores form a little face.
+    for (px, py) in [(-0.26, -0.12), (0.26, -0.12), (0.0, 0.26)] {
+        let (ox, oy) = rotate(px * rock.radius, py * rock.radius, rock.rot * 0.25);
+        let (ox, oy) = (ox * CELL_X, oy * CELL_Y);
+        let (x, y) = to_px(rock.x + ox, rock.y + oy);
+        ink.dot(x, y, 4, Color::Rgb(58, 34, 18));
+    }
+}
+
+/// A coffee cup on a saucer, upright and gently rocking. Steam rises only
+/// while it is the one being typed.
+fn draw_cup(
+    ink: &mut InkLayer,
+    to_px: &impl Fn(f32, f32) -> (f32, f32),
+    rock: &Rock,
+    style: (u8, Color),
+    (pal, time): (&Palette, f32),
+    aimed: bool,
+) {
+    let (pri, _) = style;
+    let tilt = (time * 0.9 + rock.id as f32).sin() * 0.16;
+    let f = (rock, tilt);
+    // Rim, and the coffee inside it.
+    ink_path(
+        ink,
+        to_px,
+        f,
+        &ellipse(0.0, -0.55, 0.82, 0.24, 18),
+        true,
+        style,
+    );
+    ink_path(
+        ink,
+        to_px,
+        f,
+        &ellipse(0.0, -0.52, 0.64, 0.16, 14),
+        true,
+        (pri, fade(pal.liquid, 0.9)),
+    );
+    // Body: straight sides tapering to a rounded base.
+    let mut body = vec![(-0.82, -0.55), (-0.62, 0.3)];
+    body.extend((0..=6).map(|i| {
+        let a = PI * (i as f32 / 6.0);
+        (-0.5 * a.cos() * 1.0, 0.3 + a.sin() * 0.36)
+    }));
+    body.push((0.62, 0.3));
+    body.push((0.82, -0.55));
+    ink_path(ink, to_px, f, &body, false, style);
+    // Handle on the right.
+    let handle = [(0.8, -0.38), (1.26, -0.3), (1.3, 0.05), (0.7, 0.18)];
+    ink_path(ink, to_px, f, &handle, false, style);
+    // Saucer sits below, still level.
+    let saucer: Vec<(f32, f32)> = (0..=8)
+        .map(|i| {
+            let a = PI * (i as f32 / 8.0);
+            (a.cos() * 1.15, 0.68 + a.sin() * 0.14)
+        })
+        .collect();
+    ink_path(
+        ink,
+        to_px,
+        (rock, 0.0),
+        &saucer,
+        false,
+        (pri, fade(pal.dim, 0.9)),
+    );
+    if aimed {
+        for side in [-0.28f32, 0.28] {
+            let wave = (time * 3.0 + rock.id as f32 + side * 4.0).sin() * 0.14;
+            let steam = [(side, -0.85), (side + wave, -1.1), (side - wave, -1.35)];
+            ink_path(
+                ink,
+                to_px,
+                (rock, 0.0),
+                &steam,
+                false,
+                (pri, fade(pal.faint, 0.8)),
+            );
+        }
+    }
+}
+
 fn projectile_colors(theme: Theme, pal: &Palette) -> (Color, Color) {
     match theme {
         Theme::Space | Theme::Underwater => (pal.hot, pal.accent),
@@ -431,6 +614,25 @@ pub fn draw(frame: &mut Frame, game: &Game) {
                     ink.dot(px, py, 3, col);
                 }
             }
+            Effect::Drop { x, y, vx, vy, .. } => {
+                // A short streak along the fall, brightest while airborne.
+                let (x1, y1) = to_px(*x, *y);
+                let (x0, y0) = to_px(x - vx * 0.03, y - vy * 0.03);
+                let col = fade(pal.liquid, 0.3 + 0.7 * t);
+                ink.line(x0, y0, x1, y1, 3, col);
+            }
+            Effect::Puddle { x, y, w, .. } => {
+                // Holds full strength for a while, then soaks away.
+                let k = (t * 2.2).min(1.0);
+                let col = fade(pal.liquid, 0.25 + 0.75 * k);
+                let half = w * 0.5;
+                let (a, b) = to_px(x - half, *y);
+                let (c, e) = to_px(x + half, *y);
+                ink.line(a, b, c, e, 1, col);
+                let (a, b) = to_px(x - half * 0.7, y + 0.25);
+                let (c, e) = to_px(x + half * 0.7, y + 0.25);
+                ink.line(a, b, c, e, 1, fade(col, 0.7));
+            }
             _ => {}
         }
     }
@@ -463,73 +665,26 @@ pub fn draw(frame: &mut Frame, game: &Game) {
             }
         }
 
-        // Rock / mine body.
-        let n = rock.shape.len();
-        for i in 0..n {
-            let (ax, ay) = rock.shape[i];
-            let (bx, by) = rock.shape[(i + 1) % n];
-            let (ax, ay) = rotate(ax, ay, rock.rot);
-            let (bx, by) = rotate(bx, by, rock.rot);
-            let (x0, y0) = to_px(rock.x + ax, rock.y + ay);
-            let (x1, y1) = to_px(rock.x + bx, rock.y + by);
-            ink.line(x0, y0, x1, y1, pri, col);
-        }
-
-        if game.theme == Theme::Jungle {
-            // Three germination pores.
-            let pores = [(-0.28, -0.16), (0.28, -0.16), (0.0, 0.24)];
-            for (ox, oy) in pores {
-                let (px, py) = rotate(ox, oy, rock.rot);
-                let (x, y) = to_px(rock.x + px, rock.y + py);
-                ink.dot(x, y, 4, Color::Rgb(58, 34, 18));
-            }
-        }
-
-        if game.theme == Theme::CatCafe {
-            // A coffee cup handle on the side.
-            let handle_angle = rock.rot + PI * 0.5;
-            let (hx, hy) = (handle_angle.cos(), handle_angle.sin());
-            let (hpx, hpy) = (-hy, hx);
-            let base_r = rock.radius * 0.85;
-            let loop_r = rock.radius * 1.35;
-            let p1 = (
-                rock.x + hx * base_r - hpx * 0.45,
-                rock.y + hy * base_r - hpy * 0.45,
-            );
-            let p2 = (rock.x + hx * loop_r, rock.y + hy * loop_r);
-            let p3 = (
-                rock.x + hx * base_r + hpx * 0.45,
-                rock.y + hy * base_r + hpy * 0.45,
-            );
-            let (a, b) = to_px(p1.0, p1.1);
-            let (c, d) = to_px(p2.0, p2.1);
-            let (e, f) = to_px(p3.0, p3.1);
-            ink.line(a, b, c, d, pri, pal.rock);
-            ink.line(c, d, e, f, pri, pal.rock);
-
-            // Rising steam curls above the coffee cup.
-            let steam_angle = rock.rot - PI * 0.5;
-            let (sx, sy) = (steam_angle.cos(), steam_angle.sin());
-            let (spx, spy) = (-sy, sx);
-            for side in [-0.28f32, 0.28].into_iter().filter(|_| aimed) {
-                let wave = (game.time * 3.0 + rock.id as f32 + side * 4.0).sin() * 0.18;
-                let s0 = (
-                    rock.x + sx * (rock.radius * 0.8) + spx * side,
-                    rock.y + sy * (rock.radius * 0.8) + spy * side,
-                );
-                let s1 = (
-                    rock.x + sx * (rock.radius * 1.35) + spx * (side + wave),
-                    rock.y + sy * (rock.radius * 1.35) + spy * (side + wave),
-                );
-                let (sa, sb) = to_px(s0.0, s0.1);
-                let (sc, sd) = to_px(s1.0, s1.1);
-                ink.line(sa, sb, sc, sd, pri, fade(pal.faint, 0.65));
+        match game.theme {
+            Theme::Jungle => draw_coconut(&mut ink, &to_px, rock, (pri, col), pal),
+            Theme::CatCafe => draw_cup(&mut ink, &to_px, rock, (pri, col), (pal, game.time), aimed),
+            Theme::Space | Theme::Underwater => {
+                let n = rock.shape.len();
+                for i in 0..n {
+                    let (ax, ay) = rock.shape[i];
+                    let (bx, by) = rock.shape[(i + 1) % n];
+                    let (ax, ay) = rotate(ax, ay, rock.rot);
+                    let (bx, by) = rotate(bx, by, rock.rot);
+                    let (x0, y0) = to_px(rock.x + ax, rock.y + ay);
+                    let (x1, y1) = to_px(rock.x + bx, rock.y + by);
+                    ink.line(x0, y0, x1, y1, pri, col);
+                }
             }
         }
     }
 
     let blink_off = game.invuln > 0.0 && ((game.time * 14.0) as i32).rem_euclid(2) == 0;
-    if !blink_off {
+    if !blink_off && game.phase != Phase::Shop {
         match game.theme {
             Theme::Space => draw_space_ship(&mut ink, game, pal, to_px),
             Theme::Underwater => draw_submarine(&mut ink, game, pal, to_px),
@@ -562,11 +717,26 @@ pub fn draw(frame: &mut Frame, game: &Game) {
                 game,
                 pal,
                 (rock.x + shx, rock.y + shy),
-                rock.radius,
+                // Squashed hazard art sits closer to its center.
+                match game.theme {
+                    Theme::Jungle | Theme::CatCafe => rock.radius * 0.75,
+                    _ => rock.radius,
+                },
                 &rock.word,
                 oy,
             );
         }
+    }
+
+    for gem in &game.gems {
+        let glint = ((game.time * 9.0 + gem.x).sin() > 0.5) as usize;
+        put(
+            buf,
+            (gem.x + shx).round() as i32,
+            (gem.y + shy).round() as i32 + oy,
+            ["◆", "◇"][glint],
+            style(pal.gem).add_modifier(Modifier::BOLD),
+        );
     }
 
     for effect in &game.effects {
@@ -639,6 +809,7 @@ pub fn draw(frame: &mut Frame, game: &Game) {
     draw_header(buf, game, pal, w);
     draw_dock(buf, game, pal, w, m.dock_y);
     draw_title(buf, game, pal, w, m);
+    draw_shop(buf, game, pal, w, m);
     draw_modal(buf, game, pal, w, m);
 }
 
@@ -1094,17 +1265,33 @@ fn draw_header(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w:
         style(pal.amber).add_modifier(Modifier::BOLD),
     );
     x = write(buf, x, 0, "   ", style(pal.dim));
-    for i in 0..3 {
+    let max = game.max_lives();
+    for i in 0..max {
         let (glyph, col) = if i < game.lives {
             ("♥", pal.danger)
         } else {
             ("♡", pal.dead)
         };
         x = write(buf, x, 0, glyph, style(col));
-        if i != 2 {
+        if i + 1 != max {
             x = write(buf, x, 0, " ", style(pal.dim));
         }
     }
+    if game.shield > 0 {
+        x = write(buf, x, 0, &format!(" ◈{}", game.shield), style(pal.accent));
+    }
+    let gem_col = if game.gem_flash > 0.0 {
+        pal.hot
+    } else {
+        pal.gem
+    };
+    x = write(
+        buf,
+        x,
+        0,
+        &format!("   ◆ {}", game.crystals),
+        style(gem_col).add_modifier(Modifier::BOLD),
+    );
     if w >= 60 && game.combo >= 2 {
         let _ = write(
             buf,
@@ -1218,9 +1405,19 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u
                 buf,
                 x as i32 + 2,
                 y1,
-                "esc resumes  ·  q returns to title",
+                "esc resumes  ·  q saves and quits",
                 style(pal.dim),
             );
+        }
+        Phase::Shop => {
+            put(
+                buf,
+                2,
+                y1,
+                "h l move  ·  enter select  ·  1 2 3 buy  ·  r reroll  ·  space go",
+                style(pal.dim),
+            );
+            put(buf, 2, y2, &game.shop_note, style(pal.amber));
         }
         Phase::GameOver => {
             let x = write(
@@ -1359,7 +1556,8 @@ fn draw_title(
         }),
     );
 
-    let labels: Vec<String> = MENU_ITEMS
+    let labels: Vec<String> = game
+        .menu_items()
         .iter()
         .map(|item| format!("[ {item} ]"))
         .collect();
@@ -1618,6 +1816,269 @@ fn draw_modal(
         hint,
         style(pal.faint).bg(bg),
     );
+}
+
+fn rarity_color(rarity: Rarity, pal: &Palette) -> Color {
+    match rarity {
+        Rarity::Common => pal.dim,
+        Rarity::Uncommon => pal.accent,
+        Rarity::Rare => pal.amber,
+    }
+}
+
+/// Greedy word wrap.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines
+}
+
+fn shop_name(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Space => "SUPPLY DEPOT",
+        Theme::Underwater => "DOCKYARD",
+        Theme::Jungle => "TRADING POST",
+        Theme::CatCafe => "THE COUNTER",
+    }
+}
+
+/// Fill a rectangle with a background and trace its border.
+fn draw_frame(
+    buf: &mut ratatui::buffer::Buffer,
+    rect: (i32, i32, i32, i32),
+    glyphs: [&str; 6],
+    st: Style,
+    fill: Color,
+) {
+    let (x, y, w, h) = rect;
+    let [tl, tr, bl, br, horiz, vert] = glyphs;
+    let blank = " ".repeat(w.max(0) as usize);
+    for row in 0..h {
+        put(buf, x, y + row, &blank, Style::default().bg(fill));
+    }
+    let st = st.bg(fill);
+    for col in 1..w - 1 {
+        put(buf, x + col, y, horiz, st);
+        put(buf, x + col, y + h - 1, horiz, st);
+    }
+    for row in 1..h - 1 {
+        put(buf, x, y + row, vert, st);
+        put(buf, x + w - 1, y + row, vert, st);
+    }
+    put(buf, x, y, tl, st);
+    put(buf, x + w - 1, y, tr, st);
+    put(buf, x, y + h - 1, bl, st);
+    put(buf, x + w - 1, y + h - 1, br, st);
+}
+
+fn draw_shop(
+    buf: &mut ratatui::buffer::Buffer,
+    game: &Game,
+    pal: &Palette,
+    w: u16,
+    m: crate::game::Metrics,
+) {
+    let Some(shop) = game.shop.as_ref().filter(|_| game.phase == Phase::Shop) else {
+        return;
+    };
+    let gap = 2;
+    let cols = SHOP_SLOTS as i32;
+    let card_w = ((w as i32 - 4 - gap * (cols - 1)) / cols).clamp(14, 24);
+    let total = card_w * cols + gap * (cols - 1);
+    let left = (w as i32 - total) / 2;
+    let card_h = (m.play_h as i32 - 7).clamp(7, 10);
+    let block_h = card_h + 6;
+    let top = m.origin_y as i32 + (m.play_h as i32 - block_h).max(0) / 2;
+
+    // Heading: shop name, wave, and the purse.
+    let heading = format!(
+        "{}  ·  WAVE {} CLEARED",
+        shop_name(game.theme),
+        game.wave.saturating_sub(1)
+    );
+    put_centered(
+        buf,
+        0,
+        w as i32,
+        top,
+        &heading,
+        style(pal.amber).add_modifier(Modifier::BOLD),
+    );
+    put_centered(
+        buf,
+        0,
+        w as i32,
+        top + 1,
+        &format!("◆ {} crystals", game.crystals),
+        style(pal.gem).add_modifier(Modifier::BOLD),
+    );
+
+    let cards_y = top + 3;
+    for (slot, offer) in shop.offers.iter().enumerate() {
+        let x = left + slot as i32 * (card_w + gap);
+        let def = offer.upgrade.def();
+        let selected = game.shop_sel == slot;
+        let rare = def.rarity == Rarity::Rare;
+        let edge = if offer.sold {
+            pal.dim
+        } else if selected {
+            pal.hot
+        } else {
+            rarity_color(def.rarity, pal)
+        };
+        let glyphs = match (selected, rare) {
+            (_, true) => ["╔", "╗", "╚", "╝", "═", "║"],
+            (true, false) => ["┏", "┓", "┗", "┛", "━", "┃"],
+            (false, false) => ["┌", "┐", "└", "┘", "─", "│"],
+        };
+        let fill = if selected {
+            mix(pal.chip, pal.amber, 0.14)
+        } else {
+            pal.chip
+        };
+        draw_frame(
+            buf,
+            (x, cards_y, card_w, card_h),
+            glyphs,
+            style(edge).add_modifier(if selected {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+            fill,
+        );
+        let inner = (card_w - 4) as usize;
+        let body = |col: Color| style(col).bg(fill);
+        let name = format!("{} {}", slot + 1, def.name);
+        let name: String = name.chars().take(inner).collect();
+        let name_col = if offer.sold { pal.dim } else { pal.ink };
+        put(
+            buf,
+            x + 2,
+            cards_y + 1,
+            &name,
+            body(name_col).add_modifier(Modifier::BOLD),
+        );
+        let tag = if rare {
+            format!("★ {}", def.rarity.label())
+        } else {
+            def.rarity.label().to_string()
+        };
+        put(
+            buf,
+            x + 2,
+            cards_y + 2,
+            &tag,
+            body(if offer.sold {
+                pal.dim
+            } else {
+                rarity_color(def.rarity, pal)
+            }),
+        );
+        let desc_rows = (card_h - 6).max(1) as usize;
+        for (i, line) in wrap(def.desc, inner).iter().take(desc_rows).enumerate() {
+            put(
+                buf,
+                x + 2,
+                cards_y + 4 + i as i32,
+                line,
+                body(if offer.sold { pal.faint } else { pal.dim }),
+            );
+        }
+        let foot_y = cards_y + card_h - 2;
+        if offer.sold {
+            put(
+                buf,
+                x + 2,
+                foot_y,
+                "✓ OWNED",
+                body(pal.accent).add_modifier(Modifier::BOLD),
+            );
+        } else {
+            let cost = game.upgrade_cost(offer.upgrade);
+            let afford = game.crystals >= cost;
+            let price = format!("◆ {cost}");
+            let px = x + card_w - 2 - price.chars().count() as i32;
+            put(
+                buf,
+                px,
+                foot_y,
+                &price,
+                body(if afford { pal.gem } else { pal.danger }).add_modifier(Modifier::BOLD),
+            );
+            let held = game.upgrades.level(offer.upgrade);
+            if held > 0 && !def.consumable {
+                put(
+                    buf,
+                    x + 2,
+                    foot_y,
+                    &format!("owned {held}"),
+                    body(pal.faint),
+                );
+            }
+        }
+    }
+
+    // Reroll and next-wave buttons.
+    let reroll_cost = game.reroll_cost();
+    let reroll = if reroll_cost == 0 {
+        "[ REROLL free ]".to_string()
+    } else {
+        format!("[ REROLL ◆ {reroll_cost} ]")
+    };
+    let go = "[ NEXT WAVE ]".to_string();
+    let btn_gap = 4;
+    let btn_total = (reroll.chars().count() + go.chars().count()) as i32 + btn_gap;
+    let mut bx = (w as i32 - btn_total) / 2;
+    let by = cards_y + card_h + 1;
+    for (idx, label) in [(SHOP_REROLL, reroll), (SHOP_GO, go)] {
+        let selected = game.shop_sel == idx;
+        let st = if selected {
+            style(Color::Rgb(20, 16, 8))
+                .bg(pal.amber)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            style(pal.ink)
+        };
+        put(buf, bx, by, &label, st);
+        bx += label.chars().count() as i32 + btn_gap;
+    }
+
+    // What the run holds so far.
+    let owned: Vec<String> = game
+        .upgrades
+        .held()
+        .map(|(up, level)| {
+            if up.def().max > 1 {
+                format!("{} {level}", up.def().name)
+            } else {
+                up.def().name.to_string()
+            }
+        })
+        .collect();
+    let line = if owned.is_empty() {
+        "nothing installed yet".to_string()
+    } else {
+        owned.join("  ·  ")
+    };
+    let room = (w as usize).saturating_sub(4);
+    let line: String = if line.chars().count() > room {
+        line.chars()
+            .take(room.saturating_sub(1))
+            .chain(['…'])
+            .collect()
+    } else {
+        line
+    };
+    put_centered(buf, 0, w as i32, by + 2, &line, style(pal.faint));
 }
 
 fn put_centered(
@@ -1906,6 +2367,57 @@ mod tests {
             assert!(rows[22].contains("omet"), "{screen}");
             assert!(rows[23].contains("finish the word"), "{screen}");
         }
+    }
+
+    #[test]
+    fn the_shop_shows_three_cards_and_its_buttons() {
+        use crate::game::Offer;
+        use crate::upgrades::Upgrade;
+        for theme in Theme::ALL {
+            let mut game = locked_rock_game(theme, "comet");
+            game.rocks.clear();
+            game.open_shop_for_test();
+            game.crystals = 9;
+            let shop = game.shop.as_mut().unwrap();
+            shop.offers[0] = Offer {
+                upgrade: Upgrade::SteadyHands,
+                sold: false,
+            };
+            shop.offers[1] = Offer {
+                upgrade: Upgrade::Multishot,
+                sold: false,
+            };
+            shop.offers[2] = Offer {
+                upgrade: Upgrade::SecondWind,
+                sold: true,
+            };
+            let screen = render(&game, 80, 24);
+            assert!(screen.contains("CLEARED"), "{screen}");
+            assert!(screen.contains("1 STEADY HANDS"), "{screen}");
+            assert!(screen.contains("2 MULTISHOT"), "{screen}");
+            assert!(screen.contains("✓ OWNED"), "{screen}");
+            assert!(screen.contains("REROLL"), "{screen}");
+            assert!(screen.contains("NEXT WAVE"), "{screen}");
+            assert!(screen.contains("◆ 9"), "{screen}");
+            // Still readable on the smallest supported terminal.
+            let small = render(&game, 70, 22);
+            assert!(small.contains("NEXT WAVE"), "{small}");
+        }
+    }
+
+    #[test]
+    fn the_header_shows_crystals_and_extra_hearts() {
+        let mut game = locked_rock_game(Theme::Space, "comet");
+        game.crystals = 42;
+        game.upgrades.set(crate::upgrades::Upgrade::ExtraHeart, 2);
+        let screen = render(&game, 80, 24);
+        let top = screen.lines().next().unwrap();
+        assert!(top.contains("◆ 42"), "{top}");
+        assert_eq!(
+            top.matches('♥').count() + top.matches('♡').count(),
+            5,
+            "{top}"
+        );
     }
 
     #[test]

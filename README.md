@@ -23,5 +23,8 @@ Rust 1.75 or newer. The terminal should be at least 70×22 and speak UTF-8 (brai
 - Backspace erases. Esc opens the pause popup, where you can Continue, Restart, or Quit. Quit returns to the title screen. Use `h`/`j`/`k`/`l` or the arrow keys to choose, Enter to select, and Esc to resume.
 - When a run ends, the game-over popup offers Play Again, Themes, or Quit. Play Again is selected by default, so pressing Enter starts a new run immediately. Themes works the same as on the title screen.
 - `Q` returns to the title from the pause popup, and quits the game from the title or game-over popups.
-- Hazards that reach the ship cost a life. The ship is briefly invulnerable afterward and hazards pass through it during that time. Three lives, then the wave starts over.
+- Destroyed hazards drop crystals (◆) that fly to your ship. Longer words drop more.
+- After each wave a shop offers three upgrades. Use `h`/`l` or the arrows with `Enter`, or press `1`-`3` to buy, `r` to reroll (it costs more each time), and `space` for the next wave. Stackable upgrades stay for sale until they hit their cap. Upgrades include Steady Hands (clean words pay more), multishot, shields, extra hearts, and rarer rule-benders such as Second Wind, Focus, and Alliteration.
+- Pause and pick Save & Quit (or press `Q` in the pause menu or shop) to save the run to `~/.typoids-run`. The title menu then offers Continue. A mid-wave save resumes at the start of that wave. The save is cleared when a run ends.
+- Hazards that reach the ship cost a life. The ship is briefly invulnerable afterward and hazards pass through it during that time. You start with three hearts (Extra Heart adds more); at zero the run ends.
 - Best score is remembered in `~/.typoids-best`.

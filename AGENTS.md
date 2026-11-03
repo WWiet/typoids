@@ -41,6 +41,8 @@ There is no separate lint config and no CI; `-D warnings` is the standard.
 | `src/main.rs` | Terminal setup, event loop, key handling per phase. |
 | `src/game.rs` | Simulation: state machine, hazards, typing buffer, scoring, effects, RNG, theme list, tests. |
 | `src/draw.rs` | All rendering: palettes, background, braille ink layer, ships, hazards, effects, HUD, menus, render tests. |
+| `src/upgrades.rs` | Roguelike upgrade catalog: `Upgrade`, `Rarity`, `Upgrades` (levels held), costs. Data only. |
+| `src/save.rs` | `RunSave` plus pure `encode`/`decode` for the run save file. |
 | `src/words.rs` | Lowercase ASCII word pools (`SHORT`, `MID`, `LONG`). |
 | `README.md` | Player-facing documentation. Update it when controls or themes change. |
 
@@ -56,9 +58,10 @@ are siblings and may use `crate::game::...`, `crate::draw::...`, etc.
   `update(0.0)` while paused and bumps `game.time` separately for blinking.
 - `Game::set_screen` recomputes the play area and reseeds background particles
   when the terminal size changes. It is safe to call every frame.
-- Phases are `Title`, `Playing`, `Paused`, `Dying`, `GameOver`.
-- Pause menu **Quit** (`PAUSE_QUIT`) and `Q` during pause call
-  `Game::return_to_title()`. Title and game-over Quit still set `game.quit`.
+- Phases are `Title`, `Playing`, `Paused`, `Shop`, `Dying`, `GameOver`.
+- Pause menu **Save & Quit** (`PAUSE_QUIT`) and `Q` during pause or the shop
+  call `Game::save_and_quit_to_title()`, which writes the run then calls
+  `return_to_title()`. Title and game-over Quit still set `game.quit`.
 - Menu indices are shared between the title, pause, and game-over popups, but
   each popup has its own item list (`MENU_ITEMS`, `PAUSE_ITEMS`, `OVER_ITEMS`)
   and constants (`MENU_START`, `PAUSE_CONTINUE`, `OVER_AGAIN`, ...). When you
@@ -74,6 +77,40 @@ are siblings and may use `crate::game::...`, `crate::draw::...`, etc.
   keyboard. `pool()` escalates from short to mid to long words by wave.
 - RNG is a small deterministic LCG (`Rng`): use `self.rng.range`, `self.rng.f32`,
   and `self.rng.pick`. Do not add `rand`.
+
+## Roguelike layer
+
+A run is a chain of waves. Kills drop crystals (`Gem`), crystals buy upgrades
+in a three-card shop that opens after every cleared wave (`Phase::Shop`).
+
+- **Crystals.** `detonate` calls `drop_gems`. Gems drift for 0.45s, then home
+  to the ship in `update_gems`; arrival adds to `game.crystals`. After a wave is
+  cleared any stragglers are banked instantly. They are not simulated in `draw`.
+- **Shop.** `open_shop` rolls `SHOP_SLOTS` distinct offers (`roll_offers`,
+  weighted by `Rarity::weight`, skipping maxed or pointless ones via
+  `eligible`). Buying, rerolling and leaving go through `shop_buy`,
+  `shop_reroll` and `leave_shop`; the shop never touches typing state.
+  Shop keys live in `main.rs`: `h`/`l`, `1`-`3`, `r`, `Enter`, `space`.
+- **Upgrades are data plus one hook each.** `upgrades.rs` holds the catalog.
+  The simulation reads levels with `self.upgrades.level(Upgrade::X)` /
+  `.has(...)` at the point the effect applies (see `detonate`, `chain_kills`, `integrate_rocks`, `collide`, `begin_wave`,
+  `open_shop`). Never store an effect flag that duplicates a level.
+- **Adding an upgrade.** (1) add the variant to `Upgrade`, `Upgrade::ALL`,
+  `COUNT`, and a `DEFS` entry in the same order; keep the description under
+  about 55 characters so it wraps into four short lines on a card; (2) add its
+  hook in `game.rs` and a focused test; (3) if it changes what the player sees,
+  update `draw.rs` and add a render assertion. Save files use the `key` string,
+  so never rename a key.
+- **Rarity and cost.** Rare upgrades should be unique rule-benders (single
+  level, a different way to play), not bigger numbers. Cost is
+  `Rarity::base_cost + 2 per level held`; patch kits are flat.
+- **Saves.** `~/.typoids-run` holds a `RunSave` (wave, score, lives, crystals,
+  kills, revive flag, upgrades, and whether to resume in the shop). It is
+  written when the shop opens, after each purchase or reroll, and by
+  Save & Quit; it is deleted when a run ends or a new one starts. A mid-wave
+  save resumes at the start of that wave. **Tests never write it:** only
+  `main.rs` calls `enable_persistence()`, so `persist` is off in `Game::new`.
+  Test save logic through `snapshot`/`load_run` and `save::encode`/`decode`.
 
 ## Rendering rules
 
@@ -115,18 +152,32 @@ the things the player acts on carry color. Hold to this when adding visuals.
   text, then the rest of the locked word ghosted) and one hint line. `metrics()`
   owns this (`origin_y = 1`, `dock_h = 2`). No rule lines or boxes; spacing and
   color separate things. Do not add HUD rows without a strong reason.
+- **Shop cards.** `draw_shop` lays out three framed cards by rarity: single
+  line for common, heavy for the selected card, double line and `★` for rare.
+  Prices use `pal.gem`, or `pal.danger` when unaffordable. Wrap descriptions
+  with `wrap`; never let text spill past a card's inner width.
 - **Words are chips.** `draw_label` paints every word on a `pal.chip`
   background with one padding cell on each side. The locked word gets a warmer
   chip and `‹ ›` brackets instead of padding. Do not draw bare words over the
   braille layer.
 - **One shape per job, themes only recolor.** Projectiles go through
   `draw_projectile` (dash plus three-dot tail) and `projectile_colors`.
-  Explosions are `Game::burst` (one ring, six shards). Exhaust is one dim `·`.
+  Space and Underwater explosions are `Game::burst` (one ring, six shards).
+  Jungle and Cat Cafe hazards spill instead (`Game::pour`: `Effect::Drop`
+  droplets that fall under `DROP_GRAVITY`, plus a lingering `Effect::Puddle`
+  colored `pal.liquid`). Exhaust is one dim `·`.
   Do not reintroduce per-theme spark confetti, letter bursts, lock rings, or
   blinking fuses; if a theme needs character, put it in the ship, the hazard
   silhouette, the palette, or the ring's squash/wobble.
 - **Hazards are an outline plus at most one signature mark** (mines: six short
-  horns, coconuts: three pores, cups: a handle, with steam only while locked).
+  horns; coconuts: husk fibers and a pore face; cups: rim, handle, and saucer,
+  with steam only while locked). Jungle and Cat Cafe hazards are drawn by
+  `draw_coconut` / `draw_cup` from local-frame points via `ink_path`, not from
+  `Rock.shape` (which only drives the Space/Underwater polygons).
+- **Mind the cell aspect.** A cell is about twice as tall as wide, so a circle
+  in world units draws as a tall oval. Hazard art goes through `ink_path`,
+  which squashes local y (`CELL_Y`/`CELL_X`) so shapes look round. Reuse it for
+  any new silhouette instead of calling `to_px` on raw circle points.
   The lock state is shown by color and the chip, not extra geometry.
 - **Backgrounds stay dim.** Particle density is low (`reseed_stars`), scenery
   sits at braille priority 0 in the faintest palette tones, and the Jungle
@@ -202,16 +253,25 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
   helper and assert on the resulting text (e.g. menu labels and hint copy).
   Add a render assertion when you add player-visible strings or theme visuals.
 - Every behavior change should add or update a focused test. Keep the suite
-  green; currently 22 tests.
+  green; currently 41 tests.
 
 ## Gotchas
 
+- ratatui only sends cells that changed. A terminal that wipes cells itself
+  (fullscreen toggles resize in several quick steps) leaves stale blanks that
+  never repaint on their own. `main.rs` therefore calls `terminal.clear()` on
+  any size change and again `SETTLE` after the last one; Ctrl+L forces a repaint.
+  Do not remove this, and keep it in mind for any new screen that rarely
+  changes (the shop's left card was the symptom).
 - `reseed_stars` is called on resize and theme changes; particle state is not
   preserved across those events.
 - Screen shake must not move the background; only gameplay conversion includes
   it.
 - `Game::start()` resets run state but keeps the selected theme and best score.
-- Best score persists at `~/.typoids-best` (`load_best`/`save_best`).
+- Best score persists at `~/.typoids-best` (`load_best`/`save_best`); the run
+  save is separate (`~/.typoids-run`, see the roguelike section).
+- The title menu gains a `CONTINUE` entry when a save exists (`has_save`), so
+  key handling asks `Game::title_action()` instead of comparing indices.
 - Hazards that reach the ship cost a life; during invulnerability hazards pass
   through rather than being destroyed for free.
 - Don't put gameplay elements at braille priority `0`; they would be
