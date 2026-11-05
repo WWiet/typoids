@@ -1,4 +1,5 @@
-//! A 5x7 pixel capital-letter font for the typing stage. Data only.
+//! A 5x7 pixel font (capitals, digits and a little punctuation) for the
+//! typing stage and the arcade call-outs. Data only.
 
 pub const GLYPH_W: usize = 5;
 pub const GLYPH_H: usize = 7;
@@ -85,12 +86,107 @@ const LETTERS: [[u8; GLYPH_H]; 26] = [
     ], // Z
 ];
 
-/// Is pixel (`px`, `py`) of the letter lit? Anything but a-z is blank.
-pub fn lit(c: char, px: usize, py: usize) -> bool {
+/// Digits 0-9, same layout as `LETTERS`.
+const DIGITS: [[u8; GLYPH_H]; 10] = [
+    [
+        0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+    ], // 0
+    [
+        0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+    ], // 1
+    [
+        0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+    ], // 2
+    [
+        0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110,
+    ], // 3
+    [
+        0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+    ], // 4
+    [
+        0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+    ], // 5
+    [
+        0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+    ], // 6
+    [
+        0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+    ], // 7
+    [
+        0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+    ], // 8
+    [
+        0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
+    ], // 9
+];
+
+/// Punctuation the call-outs use.
+const PUNCT: [(char, [u8; GLYPH_H]); 5] = [
+    (
+        '!',
+        [
+            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
+        ],
+    ),
+    (
+        '?',
+        [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100,
+        ],
+    ),
+    (
+        ':',
+        [
+            0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000,
+        ],
+    ),
+    (
+        '-',
+        [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+    ),
+    (
+        '.',
+        [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
+    ),
+];
+
+fn rows(c: char) -> Option<&'static [u8; GLYPH_H]> {
     let c = c.to_ascii_lowercase();
-    if !c.is_ascii_lowercase() || px >= GLYPH_W || py >= GLYPH_H {
+    if c.is_ascii_lowercase() {
+        return Some(&LETTERS[(c as u8 - b'a') as usize]);
+    }
+    if c.is_ascii_digit() {
+        return Some(&DIGITS[(c as u8 - b'0') as usize]);
+    }
+    PUNCT.iter().find(|(p, _)| *p == c).map(|(_, r)| r)
+}
+
+/// Is pixel (`px`, `py`) of the glyph lit? Unknown characters (and space)
+/// are blank.
+pub fn lit(c: char, px: usize, py: usize) -> bool {
+    if px >= GLYPH_W || py >= GLYPH_H {
         return false;
     }
-    let rows = &LETTERS[(c as u8 - b'a') as usize];
-    rows[py] >> (GLYPH_W - 1 - px) & 1 == 1
+    rows(c).is_some_and(|rows| rows[py] >> (GLYPH_W - 1 - px) & 1 == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digits_and_punctuation_have_pixels() {
+        for c in "0123456789!?:-.abcxyz".chars() {
+            let on = (0..GLYPH_H)
+                .flat_map(|y| (0..GLYPH_W).map(move |x| (x, y)))
+                .filter(|&(x, y)| lit(c, x, y))
+                .count();
+            assert!(on > 0, "{c} is blank");
+        }
+        assert!(!lit(' ', 2, 3));
+    }
 }

@@ -1,18 +1,49 @@
 //! Space, underwater, and jungle scenes. Ships, hazards, and projectiles are
 //! braille line art; words sit on top in plain cells so they stay readable.
 
-use crate::game::{metrics, rotate, Effect, Game, Metrics, Phase, Rock, Theme};
+use crate::game::{lost_banner, metrics, rotate, Effect, Game, Hit, Metrics, Phase, Rock, Theme};
+use crate::hazards::{Kind, MASK_SHOWN};
 use crate::upgrades::{Rarity, Upgrade};
 
+mod arcade;
 mod bigfont;
+mod bigtext;
 mod bossfight;
 mod ships;
 mod stage;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
+use std::cell::RefCell;
 use std::f32::consts::{PI, TAU};
 
+/// A screen rectangle in cells: (x, y, width, height).
+type Area = (i32, i32, i32, i32);
+
+thread_local! {
+    /// Where this frame put each clickable thing. Filled while drawing, read
+    /// by `main.rs` through `hit_at`.
+    static HITS: RefCell<Vec<(Area, Hit)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Record a clickable area. Later marks sit on top of earlier ones.
+fn mark(area: Area, hit: Hit) {
+    HITS.with(|h| h.borrow_mut().push((area, hit)));
+}
+
+/// What the mouse is over at cell (x, y) in the last frame drawn.
+pub fn hit_at(x: u16, y: u16) -> Option<Hit> {
+    let (x, y) = (x as i32, y as i32);
+    HITS.with(|h| {
+        h.borrow()
+            .iter()
+            .rev()
+            .find(|((ax, ay, w, hh), _)| x >= *ax && x < ax + w && y >= *ay && y < ay + hh)
+            .map(|&(_, hit)| hit)
+    })
+}
+
+#[derive(Clone, Copy)]
 struct Palette {
     bg_top: Color,
     bg_bottom: Color,
@@ -112,6 +143,18 @@ const CAT_CAFE: Palette = Palette {
     gem: Color::Rgb(150, 190, 255),
 };
 
+impl Palette {
+    /// The palette washed toward its accent, for Overdrive.
+    fn tinted(&self, k: f32) -> Palette {
+        Palette {
+            bg_top: mix(self.bg_top, self.accent, k),
+            bg_bottom: mix(self.bg_bottom, self.accent, k * 0.6),
+            chip: mix(self.chip, self.accent, k),
+            ..*self
+        }
+    }
+}
+
 fn palette(theme: Theme) -> &'static Palette {
     match theme {
         Theme::Space => &SPACE,
@@ -174,6 +217,9 @@ impl InkLayer {
     }
 
     fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, pri: u8, col: Color) {
+        let Some((x0, y0, x1, y1)) = self.clip(x0, y0, x1, y1) else {
+            return;
+        };
         let mut x = x0.round() as i32;
         let mut y = y0.round() as i32;
         let x1 = x1.round() as i32;
@@ -198,6 +244,41 @@ impl InkLayer {
                 y += sy;
             }
         }
+    }
+}
+
+impl InkLayer {
+    /// Trim a segment to the pixel grid (plus a one-pixel margin) so lines
+    /// that are mostly or entirely off-screen cost nothing to walk.
+    /// Liang-Barsky; `None` when nothing is visible.
+    fn clip(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> Option<(f32, f32, f32, f32)> {
+        let (lo_x, lo_y) = (-1.0, -1.0);
+        let (hi_x, hi_y) = (self.w as f32 * 2.0, self.h as f32 * 4.0);
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        for (p, q) in [
+            (-dx, x0 - lo_x),
+            (dx, hi_x - x0),
+            (-dy, y0 - lo_y),
+            (dy, hi_y - y0),
+        ] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    return None;
+                }
+                continue;
+            }
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+            if t0 > t1 {
+                return None;
+            }
+        }
+        Some((x0 + dx * t0, y0 + dy * t0, x0 + dx * t1, y0 + dy * t1))
     }
 }
 
@@ -350,18 +431,21 @@ fn ink_path(
     style: (u8, Color),
 ) {
     let (rock, rot) = frame;
-    let world: Vec<(f32, f32)> = pts
-        .iter()
-        .map(|(lx, ly)| {
-            let (x, y) = rotate(lx * rock.radius, ly * rock.radius, rot);
-            let (x, y) = (x * CELL_X, y * CELL_Y);
-            to_px(rock.x + x, rock.y + y)
-        })
-        .collect();
-    let last = if closed { world.len() } else { world.len() - 1 };
-    for i in 0..last {
-        let (a, b) = (world[i], world[(i + 1) % world.len()]);
-        ink.line(a.0, a.1, b.0, b.1, style.0, style.1);
+    let place = |&(lx, ly): &(f32, f32)| {
+        let (x, y) = rotate(lx * rock.radius, ly * rock.radius, rot);
+        to_px(rock.x + x * CELL_X, rock.y + y * CELL_Y)
+    };
+    let Some(first) = pts.first().map(place) else {
+        return;
+    };
+    let mut prev = first;
+    for p in pts.iter().skip(1) {
+        let next = place(p);
+        ink.line(prev.0, prev.1, next.0, next.1, style.0, style.1);
+        prev = next;
+    }
+    if closed {
+        ink.line(prev.0, prev.1, first.0, first.1, style.0, style.1);
     }
 }
 
@@ -665,15 +749,23 @@ fn draw_projectile(
 }
 
 pub fn draw(frame: &mut Frame, game: &Game) {
+    HITS.with(|h| h.borrow_mut().clear());
     let area = frame.area();
     let buf = frame.buffer_mut();
     let w = area.width;
     let h = area.height;
-    let pal = palette(game.theme);
-    if game.theme == Theme::Jungle {
-        paint_jungle_canopy(buf, area, pal, game.time);
+    let tinted;
+    let pal = if game.overdrive > 0.0 {
+        tinted = palette(game.theme).tinted(0.12);
+        &tinted
     } else {
-        paint_water(buf, area, pal);
+        palette(game.theme)
+    };
+    let scan = game.settings.scanlines;
+    if game.theme == Theme::Jungle {
+        paint_jungle_canopy(buf, area, pal, scan);
+    } else {
+        paint_water(buf, area, pal, scan);
     }
     if w < 48 || h < 18 {
         put(
@@ -715,7 +807,7 @@ pub fn draw(frame: &mut Frame, game: &Game) {
                 }
                 _ => (star.x.round() as i32, star.y.round() as i32 + oy),
             };
-            put(buf, x, y, &star.glyph.to_string(), style(pal.star));
+            put_char(buf, x, y, star.glyph, style(pal.star));
         }
     }
 
@@ -778,6 +870,8 @@ pub fn draw(frame: &mut Frame, game: &Game) {
             pal.hot
         } else if aimed {
             pal.amber
+        } else if rock.kind == Kind::Golden {
+            pal.gem
         } else {
             pal.rock
         };
@@ -793,7 +887,7 @@ pub fn draw(frame: &mut Frame, game: &Game) {
     }
 
     let blink_off = game.invuln > 0.0 && ((game.time * 14.0) as i32).rem_euclid(2) == 0;
-    if !blink_off && game.phase != Phase::Shop {
+    if !blink_off && !game.in_shop() {
         ships::draw_ship(&mut ink, game, pal, to_px);
     }
     bossfight::draw_boss(&mut ink, game, pal, to_px);
@@ -806,28 +900,13 @@ pub fn draw(frame: &mut Frame, game: &Game) {
                 continue;
             }
             let ch = char::from_u32(0x2800 + ink.bits[i] as u32).unwrap_or(' ');
-            put(
-                buf,
-                x as i32 + ox,
-                y as i32 + oy,
-                &ch.to_string(),
-                style(ink.col[i]),
-            );
+            put_char(buf, x as i32 + ox, y as i32 + oy, ch, style(ink.col[i]));
         }
     }
 
     if game.phase != Phase::Title {
         for rock in game.rocks.iter().filter(|r| r.live) {
-            draw_label(
-                buf,
-                game,
-                pal,
-                (rock.x + shx, rock.y + shy),
-                // Squashed hazard art sits closer to its center.
-                rock.radius * 0.75,
-                &rock.word,
-                oy,
-            );
+            draw_label(buf, game, pal, rock, (rock.x + shx, rock.y + shy), oy);
         }
     }
 
@@ -847,11 +926,11 @@ pub fn draw(frame: &mut Frame, game: &Game) {
             }
             let fade = if *max > 0.0 { *life / *max } else { 0.0 };
             let col = if fade > 0.45 { pal.hot } else { pal.accent };
-            put(
+            put_char(
                 buf,
                 (x + shx).round() as i32,
                 (y + shy).round() as i32 + oy,
-                &glyph.to_string(),
+                *glyph,
                 style(col),
             );
         }
@@ -880,18 +959,25 @@ pub fn draw(frame: &mut Frame, game: &Game) {
         }
     }
 
+    let called = arcade::draw_callout(buf, game, pal, m);
+    arcade::draw_announce(buf, game, pal, m);
     if game.banner_t > 0.0 && !game.banner.is_empty() {
         let col = if game.banner_t > 0.4 {
             pal.hot
         } else {
             pal.dim
         };
-        let x = ((m.play_w as usize).saturating_sub(game.banner.len())) as i32 / 2;
-        let y = (m.play_h as i32 / 2) - 2;
-        put(
+        // Under a call-out the banner becomes its subtitle.
+        let y = if called {
+            arcade::callout_top(m) + arcade::BANNER_GAP
+        } else {
+            (m.play_h as i32 / 2) - 2 + oy
+        };
+        put_centered(
             buf,
-            x.max(1),
-            y.max(0) + oy,
+            0,
+            m.play_w as i32,
+            y.max(oy),
             &game.banner,
             style(col).add_modifier(Modifier::BOLD),
         );
@@ -903,7 +989,12 @@ pub fn draw(frame: &mut Frame, game: &Game) {
     }
 
     draw_header(buf, game, pal, w);
-    if matches!(game.phase, Phase::Playing | Phase::Paused | Phase::Dying) {
+    let on_stage = match game.phase {
+        Phase::Playing | Phase::Dying => true,
+        Phase::Paused => game.paused_from == Phase::Playing,
+        _ => false,
+    };
+    if on_stage {
         stage::draw_stage(buf, game, pal, m);
     }
     bossfight::draw_boss_ui(buf, game, pal, m);
@@ -913,23 +1004,42 @@ pub fn draw(frame: &mut Frame, game: &Game) {
         play_h: m.play_h + m.stage_h,
         ..m
     };
-    draw_title(buf, game, pal, w, menu);
+    arcade::draw_title(buf, game, pal, w, menu);
     draw_shop(buf, game, pal, w, menu);
     draw_modal(buf, game, pal, w, menu);
+    arcade::draw_initials(buf, game, pal, menu);
 }
 
+/// The colour of an elite's chip mark.
+fn mark_color(kind: Kind, pal: &Palette) -> Color {
+    match kind {
+        Kind::Splitter => pal.accent,
+        Kind::Runner => pal.danger,
+        Kind::Armored => pal.amber,
+        Kind::Golden => pal.gem,
+        Kind::Masked | Kind::Normal => pal.dim,
+    }
+}
+
+/// A hazard's word on its chip, under (or above) the hazard. Elites carry
+/// a mark in front of the chip; masked words hide their tail until locked;
+/// a word that would extend the link shows a small ring in its left pad.
 fn draw_label(
     buf: &mut ratatui::buffer::Buffer,
     game: &Game,
     pal: &Palette,
+    rock: &Rock,
     pos: (f32, f32),
-    radius: f32,
-    word: &str,
     origin_y: i32,
 ) {
     let (x, y) = pos;
+    let word = rock.word.as_str();
+    // Squashed hazard art sits closer to its center.
+    let radius = rock.radius * 0.75;
+    let mark = rock.kind.mark(rock.armor);
+    let mark_w = mark.map_or(0, |m| m.chars().count() as i32);
     // One padding cell each side; the chip is word + 2 wide.
-    let width = word.len() as i32 + 2;
+    let width = word.len() as i32 + 2 + mark_w;
     let max_left = (game.play_w as i32 - width).max(0);
     let left = (x.round() as i32 - width / 2).clamp(0, max_left);
     let mut row = (y + radius + 0.85).round() as i32;
@@ -941,19 +1051,39 @@ fn draw_label(
     } else {
         0
     };
-    let locked = game.target_word() == Some(word);
+    let locked = game.target == Some(rock.id) && game.target_word() == Some(word);
     let bg = if locked {
         mix(pal.chip, pal.amber, 0.16)
     } else {
         pal.chip
     };
     let row = row + origin_y;
+    if let Some(mark) = mark {
+        put(
+            buf,
+            left,
+            row,
+            mark,
+            style(mark_color(rock.kind, pal))
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let left = left + mark_w;
     let pad = if locked {
         style(pal.amber).bg(bg).add_modifier(Modifier::BOLD)
     } else {
         style(pal.dim).bg(bg)
     };
-    put(buf, left, row, if locked { "‹" } else { " " }, pad);
+    let (open, open_st) = if locked {
+        ('‹', pad)
+    } else if game.extends_link(word) {
+        ('∘', style(pal.accent).bg(bg))
+    } else {
+        (' ', pad)
+    };
+    put_char(buf, left, row, open, open_st);
+    let masked = rock.kind == Kind::Masked && !locked;
     for (i, ch) in word.chars().enumerate() {
         let st = if i < matched {
             style(pal.amber).add_modifier(Modifier::BOLD)
@@ -962,18 +1092,26 @@ fn draw_label(
         } else {
             style(pal.dim)
         };
-        put(buf, left + 1 + i as i32, row, &ch.to_string(), st.bg(bg));
+        let ch = if masked && i >= MASK_SHOWN.max(matched) {
+            '·'
+        } else {
+            ch
+        };
+        put_char(buf, left + 1 + i as i32, row, ch, st.bg(bg));
     }
-    put(
+    put_char(
         buf,
-        left + width - 1,
+        left + width - mark_w - 1,
         row,
-        if locked { "›" } else { " " },
+        if locked { '›' } else { ' ' },
         pad,
     );
 }
 
+/// One row, arcade style: wave, 1UP score (rolling like an odometer),
+/// hearts, wards, crystals, combo, and the HI score on the right.
 fn draw_header(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w: u16) {
+    let bold = Modifier::BOLD;
     let mut x = write(
         buf,
         1,
@@ -981,20 +1119,30 @@ fn draw_header(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w:
         &format!("WAVE {:02}", game.wave.max(1)),
         style(pal.dim),
     );
+    x = write(buf, x, 0, "   1UP ", style(pal.faint));
+    let score_col = if game.score_rolling() {
+        pal.hot
+    } else {
+        pal.amber
+    };
     x = write(
         buf,
         x,
         0,
-        &format!("   {:06}", game.score),
-        style(pal.amber).add_modifier(Modifier::BOLD),
+        &format!("{:06}", game.shown_score),
+        style(score_col).add_modifier(bold),
     );
     x = write(buf, x, 0, "   ", style(pal.dim));
     let max = game.max_lives();
+    // The last heart throbs.
+    let pulse = (game.time * 5.0).sin() * 0.5 + 0.5;
     for i in 0..max {
-        let (glyph, col) = if i < game.lives {
-            ("♥", pal.danger)
-        } else {
+        let (glyph, col) = if i >= game.lives {
             ("♡", pal.dead)
+        } else if game.lives == 1 {
+            ("♥", mix(pal.danger, pal.hot, pulse * 0.6))
+        } else {
+            ("♥", pal.danger)
         };
         x = write(buf, x, 0, glyph, style(col));
         if i + 1 != max {
@@ -1013,80 +1161,117 @@ fn draw_header(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, w:
         buf,
         x,
         0,
-        &format!("   ◆ {}", game.crystals),
-        style(gem_col).add_modifier(Modifier::BOLD),
+        &format!("   ◆ {}", game.shown_crystals),
+        style(gem_col).add_modifier(bold),
     );
     if w >= 60 && game.combo >= 2 {
-        let _ = write(
+        // The combo fades as its timer runs down; big combos glow.
+        let col = if game.combo >= 10 {
+            pal.accent
+        } else {
+            mix(pal.dim, pal.amber, game.combo_ratio())
+        };
+        x = write(
             buf,
             x,
             0,
             &format!("   x{}", game.combo),
-            style(pal.amber).add_modifier(Modifier::BOLD),
+            style(col).add_modifier(bold),
         );
     }
+    let tag = match (game.daily, game.heat) {
+        (Some(_), _) => "DAILY".to_string(),
+        (None, 1..) => format!("HEAT {}", game.heat),
+        _ => String::new(),
+    };
+    let hi = format!("HI {:06}", game.best.max(game.shown_score));
     if w >= 72 {
-        let best = format!("BEST {:06}", game.best);
-        let bx = w.saturating_sub(best.chars().count() as u16 + 1);
-        let _ = write(buf, bx, 0, &best, style(pal.faint));
+        let hx = w.saturating_sub(hi.chars().count() as u16 + 1);
+        let _ = write(buf, hx, 0, &hi, style(pal.faint));
+        let tx = hx.saturating_sub(tag.chars().count() as u16 + 3);
+        if !tag.is_empty() && tx > x + 1 && game.phase != Phase::Title {
+            let _ = write(buf, tx, 0, &tag, style(pal.danger).add_modifier(bold));
+        }
     }
 }
 
-fn game_over_label(theme: Theme) -> &'static str {
+/// What the hint line says in play, per theme: (wave cleared, nothing
+/// typed yet, several matches, one locked word).
+fn hint_copy(theme: Theme) -> [&'static str; 4] {
     match theme {
-        Theme::Space => "SHIP LOST",
-        Theme::Underwater => "HULL BREACH",
-        Theme::Jungle => "MONKEY DOWN",
-        Theme::CatCafe => "CAT NAPPING",
+        Theme::Space => [
+            "wave clear — next rocks inbound",
+            "type a word to aim the ship",
+            "nearest rock is locked — keep typing to pin it",
+            "finish the word to detonate",
+        ],
+        Theme::Underwater => [
+            "minefield clear — next mines inbound",
+            "type a word to arm the torpedo",
+            "nearest mine is locked — keep typing to pin it",
+            "finish the word to detonate",
+        ],
+        Theme::Jungle => [
+            "canopy clear — more coconuts inbound",
+            "type a word to aim the monkey",
+            "nearest coconut is locked — keep typing to pin it",
+            "finish the word to throw the banana",
+        ],
+        Theme::CatCafe => [
+            "cafe clear — more coffee brewing",
+            "type a word to ready the cat",
+            "nearest cup is locked — keep typing to pin it",
+            "finish the word to pounce and scratch",
+        ],
     }
 }
 
 fn play_hint(game: &Game, word: &str, nmatch: usize) -> String {
-    match game.theme {
-        Theme::Space => {
-            if game.banner_t > 0.0 && game.banner == "WAVE CLEAR" {
-                "wave clear — next rocks inbound".to_string()
-            } else if word.is_empty() {
-                "type a word to aim the ship".to_string()
-            } else if nmatch > 1 {
-                "nearest rock is locked — keep typing to pin it".to_string()
-            } else {
-                "finish the word to detonate".to_string()
-            }
-        }
-        Theme::Underwater => {
-            if game.banner_t > 0.0 && game.banner == "MINEFIELD CLEAR" {
-                "minefield clear — next mines inbound".to_string()
-            } else if word.is_empty() {
-                "type a word to arm the torpedo".to_string()
-            } else if nmatch > 1 {
-                "nearest mine is locked — keep typing to pin it".to_string()
-            } else {
-                "finish the word to detonate".to_string()
-            }
-        }
-        Theme::Jungle => {
-            if game.banner_t > 0.0 && game.banner == "CANOPY CLEAR" {
-                "canopy clear — more coconuts inbound".to_string()
-            } else if word.is_empty() {
-                "type a word to aim the monkey".to_string()
-            } else if nmatch > 1 {
-                "nearest coconut is locked — keep typing to pin it".to_string()
-            } else {
-                "finish the word to throw the banana".to_string()
-            }
-        }
-        Theme::CatCafe => {
-            if game.banner_t > 0.0 && game.banner == "CAFE CLEAR" {
-                "cafe clear — more coffee brewing".to_string()
-            } else if word.is_empty() {
-                "type a word to ready the cat".to_string()
-            } else if nmatch > 1 {
-                "nearest cup is locked — keep typing to pin it".to_string()
-            } else {
-                "finish the word to pounce and scratch".to_string()
-            }
-        }
+    let [cleared, idle, many, locked] = hint_copy(game.theme);
+    let text = if game.wave_cleared() {
+        cleared
+    } else if word.is_empty() && game.drive_ready() {
+        "overdrive is charged — press tab to fire it"
+    } else if word.is_empty() {
+        idle
+    } else if nmatch > 1 {
+        many
+    } else {
+        locked
+    };
+    text.to_string()
+}
+
+/// The hazard noun for the miss line.
+fn hazard_noun(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Space => "rock",
+        Theme::Underwater => "mine",
+        Theme::Jungle => "coconut",
+        Theme::CatCafe => "coffee",
+    }
+}
+
+/// What went wrong with the last key: which key, and what was wanted.
+fn miss_message(game: &Game) -> String {
+    let key = game.last_wrong.map_or(String::new(), |c| format!("‹{c}› "));
+    match game.expected_letter() {
+        Some(want) => format!("{key}expected \"{want}\""),
+        None => format!(
+            "{key}no {} starts with \"{}{}\"",
+            hazard_noun(game.theme),
+            game.buffer,
+            game.last_wrong.map_or(String::new(), |c| c.to_string())
+        ),
+    }
+}
+
+/// Against the boss a miss never hurts; say what to fix before moving on.
+fn boss_miss_message(game: &Game) -> String {
+    match game.last_wrong {
+        Some(' ') => "‹space› the word has a typo: backspace and fix it first".to_string(),
+        Some(c) => format!("‹{c}› typo: backspace to fix it"),
+        None => miss_message(game),
     }
 }
 
@@ -1103,11 +1288,13 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, m: M
                 buf,
                 2,
                 y1,
-                "h j k l / arrows move  ·  enter select  ·  q quits",
+                "j k / arrows move  ·  enter select  ·  q quits",
                 style(pal.dim),
             );
             let line = if game.theme_menu_open {
                 "ENTER applies the theme. ESC goes back."
+            } else if game.options_open {
+                "ENTER or h / l changes a setting. ESC goes back."
             } else {
                 match game.theme {
                     Theme::Space => "START launches. THEMES changes the look.",
@@ -1135,24 +1322,38 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, m: M
             );
         }
         Phase::Shop => {
+            let keys = match game.rack_selected().filter(|_| game.rack_focus) {
+                Some((up, level)) => format!(
+                    "j k choose  ·  enter sells {} for ◆ {}  ·  tab back to the shelf",
+                    up.tier(level).name,
+                    up.sell_value(level)
+                ),
+                None => format!(
+                    "h l move  ·  enter select  ·  1-{} buy  ·  r reroll  ·  tab upgrades  ·  space go",
+                    game.shop_slots()
+                ),
+            };
+            put(buf, 2, y1, &keys, style(pal.dim));
+            put(buf, 2, y2, &game.shop_note, style(pal.amber));
+        }
+        Phase::Initials => {
             put(
                 buf,
                 2,
                 y1,
-                &format!(
-                    "h l move  ·  enter select  ·  1-{} buy  ·  r reroll  ·  space go",
-                    game.shop_slots()
-                ),
+                "type three letters  ·  backspace erases  ·  enter confirms",
                 style(pal.dim),
             );
-            put(buf, 2, y2, &game.shop_note, style(pal.amber));
+        }
+        Phase::Victory => {
+            put(buf, 2, y1, "h l choose  ·  enter selects", style(pal.dim));
         }
         Phase::GameOver => {
             let x = write(
                 buf,
                 2,
                 dock_y,
-                game_over_label(game.theme),
+                game_over_heading(game),
                 style(pal.danger).add_modifier(bold),
             );
             put(
@@ -1169,7 +1370,7 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, m: M
                 buf,
                 2,
                 y1,
-                game_over_label(game.theme),
+                lost_banner(game.theme),
                 style(pal.danger).add_modifier(bold),
             );
         }
@@ -1178,24 +1379,13 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, m: M
             let nmatch = game.matches();
             if m.stage_h > 0 {
                 // The stage shows the word; the dock only reports problems.
-                if game.boss.is_some() {
-                    if game.miss > 0.08 {
-                        put(
-                            buf,
-                            2,
-                            y1,
-                            "wrong key: the boss strikes!",
-                            style(pal.danger).add_modifier(bold),
-                        );
-                    }
-                } else if game.miss > 0.08 && game.buffer.is_empty() {
-                    put(
-                        buf,
-                        2,
-                        y1,
-                        miss_message(game.theme),
-                        style(pal.danger).add_modifier(bold),
-                    );
+                if game.miss > 0.08 {
+                    let text = if game.boss.is_some() {
+                        boss_miss_message(game)
+                    } else {
+                        miss_message(game)
+                    };
+                    put(buf, 2, y1, &text, style(pal.danger).add_modifier(bold));
                 } else if nmatch > 1 {
                     put(buf, 2, y1, &format!("{nmatch} match"), style(pal.dim));
                 }
@@ -1204,22 +1394,15 @@ fn draw_dock(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette, m: M
             }
             let hint = match &game.boss {
                 Some(b) if b.intro > 0.0 => {
-                    "boss incoming: type each word as it appears".to_string()
+                    "boss incoming: type the passage, space between words".to_string()
                 }
-                Some(_) => "finish every word before the clock runs out".to_string(),
+                Some(_) => {
+                    "space for the next word · backspace fixes typos · beat the clock".to_string()
+                }
                 None => play_hint(game, word, nmatch),
             };
             put(buf, 2, y2, &hint, style(pal.dim));
         }
-    }
-}
-
-fn miss_message(theme: Theme) -> &'static str {
-    match theme {
-        Theme::Space => "no rock starts with that",
-        Theme::Underwater => "no mine starts with that",
-        Theme::Jungle => "no coconut starts with that",
-        Theme::CatCafe => "no coffee starts with that",
     }
 }
 
@@ -1237,12 +1420,18 @@ fn draw_input_line(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette
             buf,
             4,
             y1,
-            miss_message(game.theme),
+            &miss_message(game),
             style(pal.danger).add_modifier(bold),
         );
         return;
     }
-    let typed_col = if missed { pal.danger } else { pal.hot };
+    // A boss typo stays in the buffer until fixed, so show it red.
+    let clean = word.is_empty() || word.starts_with(game.buffer.as_str());
+    let typed_col = if missed || !clean {
+        pal.danger
+    } else {
+        pal.hot
+    };
     let mut x = write(
         buf,
         4,
@@ -1257,7 +1446,11 @@ fn draw_input_line(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette
     };
     x = write(buf, x, dock_y, cursor, style(accent));
     // The rest of the locked word, ghosted after the cursor.
-    let rest = word.get(game.buffer.len()..).unwrap_or("");
+    let rest = if clean {
+        word.get(game.buffer.len()..).unwrap_or("")
+    } else {
+        ""
+    };
     x = write(buf, x, dock_y, rest, style(pal.faint));
     if nmatch > 1 {
         put(
@@ -1267,124 +1460,57 @@ fn draw_input_line(buf: &mut ratatui::buffer::Buffer, game: &Game, pal: &Palette
             &format!("{nmatch} match"),
             style(pal.dim),
         );
+    } else if game.drive_ready() {
+        put(
+            buf,
+            x as i32 + 2,
+            y1,
+            "TAB » OVERDRIVE",
+            style(pal.hot).add_modifier(bold),
+        );
     }
 }
 
-fn draw_title(
-    buf: &mut ratatui::buffer::Buffer,
-    game: &Game,
-    pal: &Palette,
-    w: u16,
-    m: crate::game::Metrics,
-) {
-    if game.phase != Phase::Title {
-        return;
-    }
-
-    let lines = title_lines(w >= 80);
-    let art_h = lines.len() as i32;
-    let art_w = lines[0].chars().count() as i32;
-    let block_h = art_h + if game.theme_menu_open { 7 } else { 5 };
-    let top = m.origin_y as i32 + (m.play_h as i32 - block_h).max(0) / 2;
-    let left = (w as i32 - art_w) / 2;
-
-    // Offset shadow first, then the bright face on top.
-    for (i, line) in lines.iter().enumerate() {
-        let y = top + i as i32;
-        put(buf, left + 1, y + 1, line, style(pal.shadow));
-        put(
-            buf,
-            left,
-            y,
-            line,
-            style(pal.ink).add_modifier(Modifier::BOLD),
-        );
-    }
-
-    let sub = match game.theme {
-        Theme::Space => "typing range",
-        Theme::Underwater => "~ sonar range ~",
-        Theme::Jungle => "~ canopy range ~",
-        Theme::CatCafe => "~ cozy cat cafe ~",
-    };
-    let sx = (w as i32 - sub.len() as i32) / 2;
-    let sub_y = top + art_h + 1;
-    clear_span(buf, sx - 2, sub_y, sub.len() as i32 + 4);
-    put(buf, sx, sub_y, sub, style(pal.amber));
-
-    let theme_line = if game.theme_menu_open {
-        "SELECT THEME".to_string()
+/// The game-over heading: the theme's loss line, or VICTORY after a won run.
+fn game_over_heading(game: &Game) -> &'static str {
+    if game.won {
+        "VICTORY"
     } else {
-        format!("THEME  {}", game.theme.label())
-    };
-    let tx = (w as i32 - theme_line.len() as i32) / 2;
-    let theme_y = top + art_h + 2;
-    clear_span(buf, tx - 2, theme_y, theme_line.len() as i32 + 4);
-    put(
-        buf,
-        tx,
-        theme_y,
-        &theme_line,
-        style(if game.theme_menu_open {
-            pal.amber
-        } else {
-            pal.faint
-        }),
-    );
-
-    let labels: Vec<String> = game
-        .menu_items()
-        .iter()
-        .map(|item| format!("[ {item} ]"))
-        .collect();
-    let gap = "    ";
-    let total = labels
-        .iter()
-        .map(|label| label.chars().count() as i32)
-        .sum::<i32>()
-        + gap.len() as i32 * (labels.len().saturating_sub(1)) as i32;
-    let menu_x = (w as i32 - total) / 2;
-    let menu_y = top + art_h + 3;
-    clear_span(buf, menu_x - 3, menu_y, total + 6);
-    let mut x = menu_x;
-    for (i, label) in labels.iter().enumerate() {
-        let st = if i == game.menu && !game.theme_menu_open {
-            style(Color::Rgb(20, 16, 8))
-                .bg(pal.amber)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            style(pal.dim)
-        };
-        put(buf, x, menu_y, label, st);
-        x += label.chars().count() as i32 + gap.len() as i32;
+        lost_banner(game.theme)
     }
+}
 
-    if game.theme_menu_open {
-        let choices: Vec<String> = Theme::ALL
-            .iter()
-            .map(|theme| format!("[ {} ]", theme.label()))
-            .collect();
-        let choice_gap = "   ";
-        let choice_total = choices
-            .iter()
-            .map(|label| label.chars().count() as i32)
-            .sum::<i32>()
-            + choice_gap.len() as i32 * (choices.len().saturating_sub(1)) as i32;
-        let choice_x = (w as i32 - choice_total) / 2;
-        let choice_y = top + art_h + 5;
-        clear_span(buf, choice_x - 3, choice_y, choice_total + 6);
-        let mut cx = choice_x;
-        for (i, label) in choices.iter().enumerate() {
-            let st = if i == game.theme_choice {
-                style(Color::Rgb(20, 16, 8))
-                    .bg(pal.ink)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                style(pal.dim)
-            };
-            put(buf, cx, choice_y, label, st);
-            cx += label.chars().count() as i32 + choice_gap.len() as i32;
+/// Lines of text between a popup's heading and its menu.
+fn modal_lines(game: &Game, pal: &Palette) -> Vec<(String, Color)> {
+    let score = (
+        format!("SCORE {:06}    BEST {:06}", game.score, game.best),
+        pal.ink,
+    );
+    let stats = (game.run_stats.summary(), pal.dim);
+    match game.phase {
+        Phase::GameOver => match game.boss_escaped {
+            Some(wpm) => vec![
+                score,
+                stats,
+                (format!("the boss escaped: it needed {wpm} WPM"), pal.danger),
+            ],
+            None => vec![score, stats],
+        },
+        Phase::Victory => {
+            let mut lines = vec![score, stats];
+            if game.daily.is_none() && game.settings.heat_unlocked > game.heat {
+                lines.push((
+                    format!("HEAT {} UNLOCKED", game.settings.heat_unlocked),
+                    pal.danger,
+                ));
+            }
+            lines.push((
+                "endless keeps going  ·  finish banks the score".to_string(),
+                pal.faint,
+            ));
+            lines
         }
+        _ => vec![stats],
     }
 }
 
@@ -1395,24 +1521,17 @@ fn draw_modal(
     w: u16,
     m: crate::game::Metrics,
 ) {
-    if !matches!(game.phase, Phase::Paused | Phase::GameOver) {
+    if !matches!(game.phase, Phase::Paused | Phase::GameOver | Phase::Victory) {
         return;
     }
-
-    let is_over = game.phase == Phase::GameOver;
-    let (heading, heading_col) = if is_over {
-        (
-            match game.theme {
-                Theme::Space => "SHIP LOST",
-                Theme::Underwater => "HULL BREACH",
-                Theme::Jungle => "MONKEY DOWN",
-                Theme::CatCafe => "CAT NAPPING",
-            },
-            pal.danger,
-        )
-    } else {
-        ("PAUSED", pal.amber)
+    let (heading, heading_col) = match game.phase {
+        Phase::GameOver if game.won => (game_over_heading(game), pal.amber),
+        Phase::GameOver => (game_over_heading(game), pal.danger),
+        Phase::Victory => ("THE FINAL BOSS IS DOWN", pal.amber),
+        _ => ("PAUSED", pal.amber),
     };
+    let victory = game.phase == Phase::Victory;
+    let lines = modal_lines(game, pal);
 
     let items = game.menu_items();
     let labels: Vec<String> = items.iter().map(|item| format!("[ {item} ]")).collect();
@@ -1428,17 +1547,12 @@ fn draw_modal(
     } else {
         format!("THEME  {}", game.theme.label())
     };
-    let score_line = if is_over {
-        format!("SCORE {:06}    BEST {:06}", game.score, game.best)
-    } else {
-        String::new()
-    };
     let hint = if game.theme_menu_open {
         "enter applies theme    esc backs out"
-    } else if is_over {
-        "h j k l / arrows move    enter select"
-    } else {
+    } else if game.phase == Phase::Paused {
         "h j k l / arrows move    enter select    esc resumes"
+    } else {
+        "h j k l / arrows move    enter select"
     };
 
     let choices: Vec<String> = Theme::ALL
@@ -1456,32 +1570,35 @@ fn draw_modal(
         0
     };
 
-    let inner_w = heading
-        .chars()
-        .count()
-        .max(menu_w)
-        .max(theme_line.chars().count())
-        .max(score_line.chars().count())
-        .max(choice_w)
-        .max(hint.chars().count());
+    let inner_w = lines
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .chain([
+            heading.chars().count(),
+            menu_w,
+            theme_line.chars().count(),
+            choice_w,
+            hint.chars().count(),
+        ])
+        .max()
+        .unwrap_or(0);
     let box_w = inner_w + 4;
     if box_w > w as usize {
         return;
     }
 
     // Lay out the rows inside the border.
-    let mut rel = 1usize;
-    let heading_row = rel;
-    rel += 2; // heading + blank
-    let score_row = if is_over {
-        let row = rel;
-        rel += 2; // score + blank
-        Some(row)
-    } else {
+    let heading_row = 1usize;
+    let mut rel = 3; // heading + blank
+    let lines_row = rel;
+    rel += lines.len() + 1;
+    let theme_row = if victory {
         None
+    } else {
+        let row = rel;
+        rel += 2; // theme + blank
+        Some(row)
     };
-    let theme_row = rel;
-    rel += 2; // theme + blank
     let menu_row = rel;
     rel += 1;
     let choices_row = if game.theme_menu_open {
@@ -1495,14 +1612,14 @@ fn draw_modal(
     rel += 1; // blank
     let hint_row = rel;
     rel += 1;
-    let box_h = rel + 2;
+    let box_h = rel + 1;
 
     let left = (w as usize - box_w) / 2;
     let top = m.origin_y as usize + (m.play_h as usize).saturating_sub(box_h) / 2;
     let bg = mix(pal.bg_top, pal.bg_bottom, 0.22);
 
+    let blank = " ".repeat(box_w);
     for y in top..top + box_h {
-        let blank = " ".repeat(box_w);
         put(buf, left as i32, y as i32, &blank, Style::default().bg(bg));
     }
 
@@ -1518,8 +1635,8 @@ fn draw_modal(
         border,
     );
     for y in top + 1..top + box_h - 1 {
-        put(buf, left as i32, y as i32, "│", border);
-        put(buf, (left + box_w - 1) as i32, y as i32, "│", border);
+        put_char(buf, left as i32, y as i32, '│', border);
+        put_char(buf, (left + box_w - 1) as i32, y as i32, '│', border);
     }
 
     let inner_x = (left + 2) as i32;
@@ -1532,29 +1649,31 @@ fn draw_modal(
         heading,
         style(heading_col).bg(bg).add_modifier(Modifier::BOLD),
     );
-    if let Some(row) = score_row {
+    for (i, (line, col)) in lines.iter().enumerate() {
+        put_centered(
+            buf,
+            inner_x,
+            inner_width,
+            (top + lines_row + i) as i32,
+            line,
+            style(*col).bg(bg),
+        );
+    }
+    if let Some(row) = theme_row {
         put_centered(
             buf,
             inner_x,
             inner_width,
             (top + row) as i32,
-            &score_line,
-            style(pal.ink).bg(bg),
+            &theme_line,
+            style(if game.theme_menu_open {
+                pal.amber
+            } else {
+                pal.faint
+            })
+            .bg(bg),
         );
     }
-    put_centered(
-        buf,
-        inner_x,
-        inner_width,
-        (top + theme_row) as i32,
-        &theme_line,
-        style(if game.theme_menu_open {
-            pal.amber
-        } else {
-            pal.faint
-        })
-        .bg(bg),
-    );
 
     let mut x = inner_x + (inner_width - menu_w as i32).max(0) / 2;
     for (i, label) in labels.iter().enumerate() {
@@ -1565,8 +1684,10 @@ fn draw_modal(
         } else {
             style(pal.dim).bg(bg)
         };
+        let len = label.chars().count() as i32;
         put(buf, x, (top + menu_row) as i32, label, st);
-        x += label.chars().count() as i32 + gap.len() as i32;
+        mark((x, (top + menu_row) as i32, len, 1), Hit::Menu(i));
+        x += len + gap.len() as i32;
     }
 
     if let Some(row) = choices_row {
@@ -1579,8 +1700,10 @@ fn draw_modal(
             } else {
                 style(pal.dim).bg(bg)
             };
+            let len = label.chars().count() as i32;
             put(buf, x, (top + row) as i32, label, st);
-            x += label.chars().count() as i32 + choice_gap.len() as i32;
+            mark((x, (top + row) as i32, len, 1), Hit::Theme(i));
+            x += len + choice_gap.len() as i32;
         }
     }
 
@@ -1592,6 +1715,16 @@ fn draw_modal(
         hint,
         style(pal.faint).bg(bg),
     );
+
+    // Paused: the build so far, under the box when there is room.
+    if game.phase == Phase::Paused {
+        let below = (top + box_h + 1) as i32;
+        let rows = (m.origin_y + m.play_h) as i32 - below;
+        let held: Vec<(Upgrade, u8)> = game.upgrades.held().collect();
+        if rows >= 2 {
+            draw_installed(buf, game, pal, (2, below, w as i32 - 4, rows - 1), &held);
+        }
+    }
 }
 
 fn rarity_color(rarity: Rarity, pal: &Palette) -> Color {
@@ -1662,9 +1795,13 @@ fn draw_shop(
     w: u16,
     m: crate::game::Metrics,
 ) {
-    let Some(shop) = game.shop.as_ref().filter(|_| game.phase == Phase::Shop) else {
+    let Some(shop) = game.shop.as_ref().filter(|_| game.in_shop()) else {
         return;
     };
+    if game.rack_focus {
+        draw_loadout(buf, game, pal, w, m);
+        return;
+    }
     let gap = 2;
     let cols = game.shop_slots() as i32;
     let gap = if cols > 3 { 1 } else { gap };
@@ -1701,18 +1838,44 @@ fn draw_shop(
         &heading,
         style(pal.amber).add_modifier(Modifier::BOLD),
     );
-    put_centered(
+    // The purse, then how the wave was typed.
+    let purse = format!("◆ {} crystals", game.shown_crystals);
+    let report = format!("  ·  {}", game.wave_stats.summary());
+    let line_w = (purse.chars().count() + report.chars().count()) as i32;
+    let px = (w as i32 - line_w).max(0) / 2;
+    put(
         buf,
-        0,
-        w as i32,
+        px,
         top + 1,
-        &format!("◆ {} crystals", game.crystals),
+        &purse,
         style(pal.gem).add_modifier(Modifier::BOLD),
     );
+    if line_w <= w as i32 {
+        put(
+            buf,
+            px + purse.chars().count() as i32,
+            top + 1,
+            &report,
+            style(pal.dim),
+        );
+    }
 
     let cards_y = top + 3;
     for slot in 0..game.shop_slots() {
         let x = left + slot as i32 * (card_w + gap);
+        // Cards rise into place one after another when the shop opens.
+        let rise = if game.settings.reduced_motion {
+            0.0
+        } else {
+            ((game.time - game.shop_t0 - slot as f32 * 0.05) / 0.3).clamp(0.0, 1.0)
+        };
+        let cards_y = cards_y
+            + if game.settings.reduced_motion {
+                0
+            } else {
+                ((1.0 - rise) * (1.0 - rise) * 8.0).round() as i32
+            };
+        mark((x, cards_y, card_w, card_h), Hit::Shop(slot));
         let Some(offer) = shop.offers.get(slot) else {
             // Nothing left to sell: keep the slot on screen, clearly empty.
             let selected = game.shop_sel == slot;
@@ -1739,7 +1902,7 @@ fn draw_shop(
         };
         let def = offer.upgrade.def();
         let rarity = offer.rarity();
-        let selected = game.shop_sel == slot;
+        let selected = game.shop_sel == slot && !game.rack_focus;
         let rare = rarity == Rarity::Rare;
         let edge = if offer.sold {
             pal.dim
@@ -1753,7 +1916,11 @@ fn draw_shop(
             (true, false) => ["┏", "┓", "┗", "┛", "━", "┃"],
             (false, false) => ["┌", "┐", "└", "┘", "─", "│"],
         };
-        let fill = if selected {
+        let bought = game.time - game.bought_t.get(slot).copied().unwrap_or(-10.0);
+        let fill = if (0.0..0.3).contains(&bought) {
+            // A purchase flashes the card once.
+            mix(pal.chip, pal.hot, 0.5 * (1.0 - bought / 0.3))
+        } else if selected {
             mix(pal.chip, pal.amber, 0.14)
         } else {
             pal.chip
@@ -1798,7 +1965,7 @@ fn draw_shop(
             }),
         );
         let desc_rows = (card_h - 6).max(1) as usize;
-        let blurb = offer.upgrade.blurb(offer.tier);
+        let blurb = offer.upgrade.blurb_delta(offer.tier.saturating_sub(1));
         for (i, line) in wrap(&blurb, inner).iter().take(desc_rows).enumerate() {
             put(
                 buf,
@@ -1830,15 +1997,14 @@ fn draw_shop(
                 body(if afford { pal.gem } else { pal.danger }).add_modifier(Modifier::BOLD),
             );
             let held = game.upgrades.level(offer.upgrade);
-            if held > 0 && !def.consumable {
-                put(
-                    buf,
-                    x + 2,
-                    foot_y,
-                    &format!("owned {held}"),
-                    body(pal.faint),
-                );
-            }
+            let note = if held > 0 && !def.consumable {
+                format!("owned {held}")
+            } else if !def.consumable && game.rack_used() >= game.rack_size() {
+                "rack full".to_string()
+            } else {
+                String::new()
+            };
+            put(buf, x + 2, foot_y, &note, body(pal.faint));
         }
     }
 
@@ -1850,48 +2016,222 @@ fn draw_shop(
         format!("[ REROLL ◆ {reroll_cost} ]")
     };
     let go = "[ NEXT WAVE ]".to_string();
+    let mine = "[ MY UPGRADES ]".to_string();
     let btn_gap = 4;
-    let btn_total = (reroll.chars().count() + go.chars().count()) as i32 + btn_gap;
-    let mut bx = (w as i32 - btn_total) / 2;
+    let btn_total =
+        (reroll.chars().count() + go.chars().count() + mine.chars().count()) as i32 + btn_gap * 2;
+    let mut bx = (w as i32 - btn_total).max(0) / 2;
     let by = cards_y + card_h + 1;
-    for (idx, label) in [
-        (game.shop_reroll_index(), reroll),
-        (game.shop_go_index(), go),
+    for (hit, label) in [
+        (Hit::Shop(game.shop_reroll_index()), reroll),
+        (Hit::Shop(game.shop_go_index()), go),
+        (Hit::Loadout, mine),
     ] {
-        let selected = game.shop_sel == idx;
+        let selected = hit == Hit::Shop(game.shop_sel);
         let st = if selected {
             style(Color::Rgb(20, 16, 8))
                 .bg(pal.amber)
                 .add_modifier(Modifier::BOLD)
+        } else if hit == Hit::Loadout {
+            style(pal.dim)
         } else {
             style(pal.ink)
         };
+        let len = label.chars().count() as i32;
         put(buf, bx, by, &label, st);
-        bx += label.chars().count() as i32 + btn_gap;
+        mark((bx, by, len, 1), hit);
+        bx += len + btn_gap;
     }
 
-    draw_installed(buf, pal, (left, by + 2, total, table_rows - 1), &held);
+    draw_installed(buf, game, pal, (left, by + 2, total, table_rows - 1), &held);
+}
+
+/// One installed line on the upgrades screen: its rows of text.
+fn loadout_entry(up: Upgrade, level: u8, inner: usize) -> Vec<String> {
+    let mut rows = wrap(&up.blurb(level), inner);
+    if level < up.max() {
+        let next = up.tier(level + 1).name;
+        // Lines whose numbers grow say by how much; the rest just name it.
+        let step = up.blurb_delta(level);
+        let line = if step == up.blurb(level) {
+            format!("next: {next}")
+        } else {
+            format!("next: {next} · {step}")
+        };
+        rows.extend(wrap(&line, inner));
+    }
+    rows.iter_mut()
+        .for_each(|r| *r = r.chars().take(inner).collect());
+    rows
+}
+
+/// The shop's upgrades screen (Tab): every installed line with its card
+/// name, level, what it does now and what the next card adds, plus its
+/// sell price. The cursor picks the line to sell.
+fn draw_loadout(
+    buf: &mut ratatui::buffer::Buffer,
+    game: &Game,
+    pal: &Palette,
+    w: u16,
+    m: crate::game::Metrics,
+) {
+    let held: Vec<(Upgrade, u8)> = game.upgrades.held().collect();
+    let width = (w as i32 - 4).min(76);
+    let left = (w as i32 - width) / 2;
+    let inner = (width - 4).max(10) as usize;
+    let top = m.origin_y as i32;
+    let bottom = (m.origin_y + m.play_h) as i32 - 1;
+    // A clean page: no background specks between the rows.
+    for y in top..=bottom {
+        clear_span(buf, left - 2, y, width + 4);
+    }
+    put_centered(
+        buf,
+        0,
+        w as i32,
+        top,
+        &format!(
+            "MY UPGRADES  ·  RACK {}/{}",
+            game.rack_used(),
+            game.rack_size()
+        ),
+        style(pal.amber).add_modifier(Modifier::BOLD),
+    );
+    put_centered(
+        buf,
+        0,
+        w as i32,
+        top + 1,
+        &format!("◆ {} crystals", game.shown_crystals),
+        style(pal.gem).add_modifier(Modifier::BOLD),
+    );
+
+    // Each entry is a name line plus its description rows and a gap.
+    let entries: Vec<Vec<String>> = held
+        .iter()
+        .map(|&(up, level)| loadout_entry(up, level, inner))
+        .collect();
+    let height = |i: usize| entries[i].len() as i32 + 2;
+    let list_top = top + 3;
+    let room = bottom - 1 - list_top;
+    // Scroll so the cursor's entry is on screen.
+    let sel = game.rack_sel.min(held.len().saturating_sub(1));
+    let mut first = 0;
+    while first < sel && (first..=sel).map(height).sum::<i32>() > room {
+        first += 1;
+    }
+    let mut y = list_top;
+    let mut last = first;
+    for (i, &(up, level)) in held.iter().enumerate().skip(first) {
+        if y + height(i) - 1 > list_top + room {
+            break;
+        }
+        last = i + 1;
+        let on = i == sel;
+        let tier = up.tier(level);
+        let fill = if on {
+            mix(pal.chip, pal.amber, 0.14)
+        } else {
+            pal.chip
+        };
+        let h = height(i) - 1;
+        for r in 0..h {
+            put(
+                buf,
+                left,
+                y + r,
+                &" ".repeat(width as usize),
+                style(pal.ink).bg(fill),
+            );
+        }
+        let body = |col: Color| style(col).bg(fill);
+        let lead = if on { "▸ " } else { "  " };
+        put(
+            buf,
+            left,
+            y,
+            &format!("{lead}{}", tier.name),
+            body(rarity_color(tier.rarity, pal)).add_modifier(Modifier::BOLD),
+        );
+        let pips: String = (0..up.max())
+            .map(|n| if n < level { '●' } else { '○' })
+            .collect();
+        put(buf, left + 16, y, &pips, body(pal.dim));
+        let price = format!("sell ◆ {}", up.sell_value(level));
+        let px = left + width - 2 - price.chars().count() as i32;
+        put(
+            buf,
+            px,
+            y,
+            &price,
+            body(if on { pal.gem } else { pal.faint }),
+        );
+        let now_rows = wrap(&up.blurb(level), inner).len();
+        for (r, line) in entries[i].iter().enumerate() {
+            let col = if r >= now_rows { pal.faint } else { pal.ink };
+            put(buf, left + 2, y + 1 + r as i32, line, body(col));
+        }
+        mark((left, y, width, h), Hit::Rack(i));
+        y += height(i);
+    }
+    let hidden = held.len() - (last - first);
+    if hidden > 0 {
+        let above = if first > 0 { "↑ " } else { "" };
+        let below = if last < held.len() { " ↓" } else { "" };
+        put_centered(
+            buf,
+            0,
+            w as i32,
+            bottom - 1,
+            &format!("{above}{hidden} more{below}"),
+            style(pal.faint),
+        );
+    }
+
+    // Buttons for the mouse; Enter and Tab do the same.
+    let sell = match held.get(sel) {
+        Some(&(up, level)) => format!("[ SELL ◆ {} ]", up.sell_value(level)),
+        None => "[ SELL ]".to_string(),
+    };
+    let back = "[ BACK TO SHOP ]".to_string();
+    let total = (sell.chars().count() + back.chars().count()) as i32 + 4;
+    let mut bx = (w as i32 - total).max(0) / 2;
+    for (hit, label, col) in [(Hit::Sell, sell, pal.danger), (Hit::Loadout, back, pal.ink)] {
+        let len = label.chars().count() as i32;
+        put(
+            buf,
+            bx,
+            bottom,
+            &label,
+            style(col).add_modifier(Modifier::BOLD),
+        );
+        mark((bx, bottom, len, 1), hit);
+        bx += len + 4;
+    }
 }
 
 /// Width of one column in the installed table: a 12-letter name, a gap, pips.
 const TABLE_COL_W: i32 = 22;
 
-/// The run's upgrades as a table: one cell per line showing its newest card
-/// and level pips. Rows that do not fit above the dock are summarized.
+/// The run's rack as a table: one cell per line showing its newest card
+/// and level pips, under a RACK used/size heading. In the shop's sell mode
+/// the cursor sits on a cell. Rows that do not fit are summarized.
 fn draw_installed(
     buf: &mut ratatui::buffer::Buffer,
+    game: &Game,
     pal: &Palette,
     area: (i32, i32, i32, i32),
     held: &[(Upgrade, u8)],
 ) {
     let (left, top, width, rows) = area;
+    let heading = format!("RACK {}/{}", game.rack_used(), game.rack_size());
     if held.is_empty() {
         put_centered(
             buf,
             0,
             buf.area.width as i32,
             top,
-            "nothing installed yet",
+            &format!("{heading}  ·  nothing installed yet"),
             style(pal.faint),
         );
         return;
@@ -1899,24 +2239,44 @@ fn draw_installed(
     let cols = ((width / TABLE_COL_W).max(1) as usize).min(held.len());
     let table_w = cols as i32 * TABLE_COL_W;
     let x0 = left + (width - table_w).max(0) / 2;
-    let shown = (rows.max(0) as usize * cols).min(held.len());
-    let more = if shown < held.len() {
-        format!("  (+{} more)", held.len() - shown)
+    let cursor = game.rack_focus.then_some(game.rack_sel);
+    // Scroll so the cursor's row is always shown.
+    let fit = rows.max(1) as usize;
+    let first_row = cursor.map_or(0, |c| (c / cols + 1).saturating_sub(fit));
+    let skip = first_row * cols;
+    let shown = (fit * cols).min(held.len() - skip);
+    let more = held.len() - shown;
+    let more = if more > 0 {
+        format!("  (+{more} more)")
     } else {
         String::new()
+    };
+    let sell = if game.in_shop() && !game.rack_focus {
+        "  ·  tab for details"
+    } else {
+        ""
     };
     put(
         buf,
         x0,
         top,
-        &format!("INSTALLED {}{more}", held.len()),
+        &format!("{heading}{more}{sell}"),
         style(pal.dim).add_modifier(Modifier::BOLD),
     );
-    for (i, &(up, level)) in held.iter().take(shown).enumerate() {
-        let x = x0 + (i % cols) as i32 * TABLE_COL_W;
-        let y = top + 1 + (i / cols) as i32;
+    mark((x0, top, table_w, rows.max(1) + 1), Hit::Loadout);
+    for (i, &(up, level)) in held.iter().enumerate().skip(skip).take(shown) {
+        let cell = i - skip;
+        let x = x0 + (cell % cols) as i32 * TABLE_COL_W;
+        let y = top + 1 + (cell / cols) as i32;
         let tier = up.tier(level);
-        put(buf, x, y, tier.name, style(rarity_color(tier.rarity, pal)));
+        let st = if cursor == Some(i) {
+            style(Color::Rgb(20, 16, 8))
+                .bg(pal.amber)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            style(rarity_color(tier.rarity, pal))
+        };
+        put(buf, x, y, tier.name, st);
         if up.max() > 1 {
             let pips: String = (0..up.max())
                 .map(|n| if n < level { '●' } else { '○' })
@@ -1938,46 +2298,9 @@ fn put_centered(
     put(buf, x0 + (width - len).max(0) / 2, y, text, st);
 }
 
-const TITLE_GLYPHS: [[u8; 5]; 7] = [
-    [0b11111, 0b00100, 0b00100, 0b00100, 0b00100], // T
-    [0b10001, 0b10001, 0b01010, 0b00100, 0b00100], // Y
-    [0b11110, 0b10001, 0b11110, 0b10000, 0b10000], // P
-    [0b01110, 0b10001, 0b10001, 0b10001, 0b01110], // O
-    [0b11111, 0b00100, 0b00100, 0b00100, 0b11111], // I
-    [0b11110, 0b10001, 0b10001, 0b10001, 0b11110], // D
-    [0b11111, 0b10000, 0b01110, 0b00001, 0b11111], // S
-];
-
-fn title_lines(wide: bool) -> Vec<String> {
-    let mut lines = Vec::with_capacity(TITLE_GLYPHS[0].len());
-    for row in 0..TITLE_GLYPHS[0].len() {
-        let mut line = String::new();
-        for (i, glyph) in TITLE_GLYPHS.iter().enumerate() {
-            if i > 0 {
-                line.push(' ');
-            }
-            for col in (0..5).rev() {
-                if glyph[row] & (1 << col) != 0 {
-                    line.push('█');
-                    if wide {
-                        line.push('█');
-                    }
-                } else {
-                    line.push(' ');
-                    if wide {
-                        line.push(' ');
-                    }
-                }
-            }
-        }
-        lines.push(line);
-    }
-    lines
-}
-
 fn hline(buf: &mut ratatui::buffer::Buffer, x0: u16, x1: u16, y: u16, col: Color) {
     for x in x0..x1 {
-        put(buf, x as i32, y as i32, "─", style(col));
+        put_char(buf, x as i32, y as i32, '─', style(col));
     }
 }
 
@@ -1998,6 +2321,14 @@ fn put(buf: &mut ratatui::buffer::Buffer, x: i32, y: i32, text: &str, style: Sty
     buf.set_string(x, y, text, style);
 }
 
+/// One glyph in one cell, without building a `String`.
+fn put_char(buf: &mut ratatui::buffer::Buffer, x: i32, y: i32, ch: char, st: Style) {
+    if x < 0 || y < 0 || x >= buf.area.width as i32 || y >= buf.area.height as i32 {
+        return;
+    }
+    buf[(x as u16, y as u16)].set_char(ch).set_style(st);
+}
+
 fn clear_span(buf: &mut ratatui::buffer::Buffer, x: i32, y: i32, width: i32) {
     if width <= 0 {
         return;
@@ -2010,14 +2341,25 @@ fn style(fg: Color) -> Style {
     Style::default().fg(fg)
 }
 
-fn paint_water(buf: &mut ratatui::buffer::Buffer, area: Rect, pal: &Palette) {
+/// Background shade of odd rows with scanlines on.
+const SCANLINE: f32 = 0.9;
+
+fn scanline(col: Color, y: u16, on: bool) -> Color {
+    if on && y % 2 == 1 {
+        fade(col, SCANLINE)
+    } else {
+        col
+    }
+}
+
+fn paint_water(buf: &mut ratatui::buffer::Buffer, area: Rect, pal: &Palette, scan: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let span = area.height.saturating_sub(1).max(1) as f32;
     for y in 0..area.height {
         let t = y as f32 / span;
-        let col = mix(pal.bg_top, pal.bg_bottom, t);
+        let col = scanline(mix(pal.bg_top, pal.bg_bottom, t), y, scan);
         buf.set_style(
             Rect::new(area.x, area.y + y, area.width, 1),
             Style::default().bg(col),
@@ -2027,10 +2369,42 @@ fn paint_water(buf: &mut ratatui::buffer::Buffer, area: Rect, pal: &Palette) {
 
 /// A shaded canopy: deep green gradient with subtle, soft dappled shading
 /// and a dark vignette that stays calm and readable behind gameplay.
-fn paint_jungle_canopy(buf: &mut ratatui::buffer::Buffer, area: Rect, pal: &Palette, _time: f32) {
+fn paint_jungle_canopy(buf: &mut ratatui::buffer::Buffer, area: Rect, pal: &Palette, scan: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // The canopy never changes for a given size, so shade it once and copy.
+    CANOPY.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = (area.width, area.height, pal.bg_top, scan);
+        if cache.0 != key {
+            *cache = (key, shade_canopy(area, pal, scan));
+        }
+        if buf.area == area {
+            // The common case: the canopy covers the whole buffer.
+            for (cell, col) in buf.content.iter_mut().zip(&cache.1) {
+                cell.set_bg(*col);
+            }
+            return;
+        }
+        let w = area.width as usize;
+        for (i, col) in cache.1.iter().enumerate() {
+            let (x, y) = ((i % w) as u16, (i / w) as u16);
+            buf[(area.x + x, area.y + y)].set_bg(*col);
+        }
+    });
+}
+
+type CanopyKey = (u16, u16, Color, bool);
+
+thread_local! {
+    static CANOPY: std::cell::RefCell<(CanopyKey, Vec<Color>)> =
+        const { std::cell::RefCell::new(((0, 0, Color::Reset, false), Vec::new())) };
+}
+
+/// Background colors for every cell of the canopy, row by row.
+fn shade_canopy(area: Rect, pal: &Palette, scan: bool) -> Vec<Color> {
+    let mut out = Vec::with_capacity(area.width as usize * area.height as usize);
     let w = area.width as f32;
     let h = area.height.max(1) as f32;
     let leaf_shade = fade(pal.shadow, 0.4);
@@ -2052,9 +2426,10 @@ fn paint_jungle_canopy(buf: &mut ratatui::buffer::Buffer, area: Rect, pal: &Pale
 
             let mut col = mix(base, leaf_shade, dappled * 0.08);
             col = mix(col, deep, (ceiling * 0.7 + edge * 0.3).min(1.0));
-            buf[(area.x + x, area.y + y)].set_bg(col);
+            out.push(scanline(col, y, scan));
         }
     }
+    out
 }
 
 fn mix(a: Color, b: Color, t: f32) -> Color {
@@ -2102,6 +2477,49 @@ mod tests {
         out
     }
 
+    /// Frame cost per theme. Run with
+    /// `cargo test --release frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn frame_cost() {
+        let (w, h) = (200, 60);
+        for theme in Theme::ALL {
+            let mut game = Game::new(w, h, 7);
+            game.theme_choice = theme.index();
+            game.apply_theme();
+            game.start();
+            for _ in 0..240 {
+                game.update(1.0 / 120.0);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let n = 2000;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                terminal.draw(|frame| draw(frame, &game)).unwrap();
+            }
+            let ours = t0.elapsed() / n;
+            let t1 = std::time::Instant::now();
+            for _ in 0..n {
+                terminal.draw(|_| {}).unwrap();
+            }
+            eprintln!(
+                "{theme:?}: {ours:?} per frame (empty frame {:?})",
+                t1.elapsed() / n
+            );
+        }
+    }
+
+    #[test]
+    fn lines_far_off_screen_are_clipped_away() {
+        let mut ink = InkLayer::new(10, 5, Color::Reset);
+        let t0 = std::time::Instant::now();
+        ink.line(-1e7, -1e7, -1e7, 1e7, 1, Color::Reset);
+        ink.line(-1e7, 3.0, 1e7, 3.0, 1, Color::Reset);
+        assert!(t0.elapsed().as_millis() < 50, "walked the whole line");
+        // The crossing line still lands on screen, the other does not.
+        assert_eq!(ink.bits.iter().filter(|&&b| b != 0).count(), 10);
+    }
+
     #[test]
     fn paused_popup_shows_its_choices() {
         let mut game = Game::new(80, 24, 7);
@@ -2122,6 +2540,7 @@ mod tests {
         game.theme_choice = Theme::Jungle.index();
         game.apply_theme();
         game.start();
+        game.skip_ready_for_test();
         game.rocks.clear();
         game.effects.clear();
         game.banner.clear();
@@ -2146,6 +2565,8 @@ mod tests {
             word: "coconut".into(),
             live: true,
             hit: 0.0,
+            kind: Kind::Normal,
+            armor: 0,
         });
         game.type_char('c');
         for _ in 0..6 {
@@ -2164,6 +2585,7 @@ mod tests {
         game.theme_choice = theme.index();
         game.apply_theme();
         game.start();
+        game.skip_ready_for_test();
         game.rocks.clear();
         game.effects.clear();
         game.banner.clear();
@@ -2188,6 +2610,8 @@ mod tests {
             word: word.into(),
             live: true,
             hit: 0.0,
+            kind: Kind::Normal,
+            armor: 0,
         });
         game.type_char(word.chars().next().unwrap());
         // Long enough for the stage animations to settle.
@@ -2205,11 +2629,19 @@ mod tests {
             let rows: Vec<&str> = screen.lines().collect();
             assert!(rows[0].contains("WAVE 01"), "{screen}");
             assert!(rows[0].contains("♥"), "{screen}");
-            assert!(rows[0].contains("BEST"), "{screen}");
+            assert!(
+                rows[0].contains("1UP") && rows[0].contains("HI"),
+                "{screen}"
+            );
             assert!(!screen.contains("HULL"), "{screen}");
             assert!(screen.contains("‹comet›"), "locked chip\n{screen}");
             assert!(rows[23].contains("finish the word"), "{screen}");
         }
+    }
+
+    /// The stage floor: a rule, possibly part-filled by the Overdrive meter.
+    fn floor_line(row: &str) -> bool {
+        row.starts_with('─') || row.starts_with('━')
     }
 
     fn stage_rows(screen: &str, from: usize, to: usize) -> String {
@@ -2230,7 +2662,7 @@ mod tests {
             let stage = stage_rows(&screen, 17, 21);
             assert!(stage.contains('█'), "typed letter\n{screen}");
             assert!(stage.contains('▀') || stage.contains('▄'), "{screen}");
-            assert!(screen.lines().nth(21).unwrap().starts_with('─'), "{screen}");
+            assert!(floor_line(screen.lines().nth(21).unwrap()), "{screen}");
             // Five letters of 10 columns each fill most of the row; the old
             // one-line input is gone.
             assert!(!screen.lines().nth(22).unwrap().contains('›'), "{screen}");
@@ -2244,7 +2676,7 @@ mod tests {
         // 1 header, 40 play rows, a 5-row stage from row 41, 2 dock rows.
         let stage = stage_rows(&screen, 41, 45);
         assert!(stage.contains('█'), "{screen}");
-        assert!(screen.lines().nth(45).unwrap().starts_with('─'), "{screen}");
+        assert!(floor_line(screen.lines().nth(45).unwrap()), "{screen}");
     }
 
     #[test]
@@ -2282,6 +2714,7 @@ mod tests {
             game.rocks.clear();
             game.open_shop_for_test();
             game.crystals = 9;
+            game.snap_counters();
             let shop = game.shop.as_mut().unwrap();
             shop.offers[0] = Offer::new(Upgrade::SteadyHands, 1);
             shop.offers[1] = Offer::new(Upgrade::Multishot, 1);
@@ -2305,6 +2738,7 @@ mod tests {
     fn the_header_shows_crystals_and_extra_hearts() {
         let mut game = locked_rock_game(Theme::Space, "comet");
         game.crystals = 42;
+        game.snap_counters();
         game.upgrades.set(crate::upgrades::Upgrade::ExtraHeart, 2);
         let screen = render(&game, 80, 24);
         let top = screen.lines().next().unwrap();
@@ -2332,7 +2766,7 @@ mod tests {
         }
         game.open_shop_for_test();
         let screen = render(&game, 80, 24);
-        assert!(screen.contains("INSTALLED 5"), "{screen}");
+        assert!(screen.contains("RACK 5/6"), "{screen}");
         assert!(
             screen.contains("GOLD PAN"),
             "newest card of the line\n{screen}"
@@ -2369,6 +2803,7 @@ mod tests {
             assert!(intro.contains("BOSS FIGHT"), "{intro}");
             assert!(intro.contains("40 WPM"), "{intro}");
             assert!(intro.contains("starting in"), "{intro}");
+            assert!(intro.contains("fix typos"), "{intro}");
             for _ in 0..70 {
                 game.update(0.05);
             }
@@ -2378,8 +2813,37 @@ mod tests {
             assert!(fight.contains("/ 40 WPM"), "{fight}");
             let word = game.target_word().unwrap().to_string();
             assert!(fight.contains(&word), "passage shows {word}\n{fight}");
-            assert!(fight.contains("finish every word"), "{fight}");
+            assert!(fight.contains("space for the next word"), "{fight}");
+            // The seconds never run into the pace readout on narrow screens.
+            let narrow = render(&game, 70, 22);
+            let status = narrow.lines().nth(1).unwrap();
+            assert!(
+                status.contains("s ") && status.contains(" / 40 WPM"),
+                "{status}"
+            );
         }
+    }
+
+    #[test]
+    fn boss_typos_say_how_to_fix_them() {
+        let mut game = locked_rock_game(Theme::Space, "comet");
+        game.begin_wave_for_test(5);
+        for _ in 0..70 {
+            game.update(0.05);
+        }
+        let word = game.target_word().unwrap().to_string();
+        let bad = if word.starts_with('z') { 'q' } else { 'z' };
+        game.type_char(bad);
+        let screen = render(&game, 80, 24);
+        assert!(
+            screen.contains(&format!("‹{bad}› typo: backspace")),
+            "{screen}"
+        );
+        game.update(0.5);
+        game.type_space();
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("‹space› the word has a typo"), "{screen}");
+        assert!(!screen.contains("strikes"), "{screen}");
     }
 
     #[test]
@@ -2452,6 +2916,7 @@ mod tests {
         game.theme_choice = Theme::CatCafe.index();
         game.apply_theme();
         game.start();
+        game.skip_ready_for_test();
         game.rocks.clear();
         game.effects.clear();
         game.banner.clear();
@@ -2476,6 +2941,8 @@ mod tests {
             word: "coffee".into(),
             live: true,
             hit: 0.0,
+            kind: Kind::Normal,
+            armor: 0,
         });
         game.type_char('c');
         for _ in 0..6 {
@@ -2526,10 +2993,10 @@ mod tests {
         let pal = palette(Theme::Jungle);
 
         let mut buf0 = ratatui::buffer::Buffer::empty(area);
-        paint_jungle_canopy(&mut buf0, area, pal, 0.0);
+        paint_jungle_canopy(&mut buf0, area, pal, false);
 
         let mut buf1 = ratatui::buffer::Buffer::empty(area);
-        paint_jungle_canopy(&mut buf1, area, pal, 10.0);
+        paint_jungle_canopy(&mut buf1, area, pal, false);
 
         // Background colors should remain calm and stable across frames.
         for y in 0..area.height {
@@ -2541,5 +3008,208 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_title_is_an_attract_screen() {
+        let mut game = Game::new(80, 24, 7);
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("PRESS ENTER"), "{screen}");
+        assert!(screen.contains("DAILY RUN"), "{screen}");
+        assert!(screen.contains("HOW TO PLAY"), "{screen}");
+        for _ in 0..200 {
+            game.update(0.05);
+        }
+        let idle = render(&game, 80, 24);
+        assert!(idle.contains("HI-SCORES"), "{idle}");
+        assert!(idle.contains("1ST"), "{idle}");
+        // The smallest terminal drops the block letters but keeps the menu.
+        let small = render(&Game::new(48, 18, 7), 48, 18);
+        assert!(small.contains("T Y P O I D S"), "{small}");
+        assert!(small.contains("START"), "{small}");
+    }
+
+    #[test]
+    fn options_and_help_draw_on_the_title() {
+        let mut game = Game::new(80, 24, 7);
+        game.open_options();
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("SCREEN SHAKE"), "{screen}");
+        assert!(screen.contains("FULL"), "{screen}");
+        game.close_options();
+        game.open_help();
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("OVERDRIVE"), "{screen}");
+        assert!(screen.contains("press any key"), "{screen}");
+    }
+
+    #[test]
+    fn wave_call_outs_are_big_pixel_letters() {
+        let mut game = Game::new(80, 24, 7);
+        game.start();
+        for _ in 0..6 {
+            game.update(0.05);
+        }
+        let screen = render(&game, 80, 24);
+        let middle = stage_rows(&screen, 5, 12);
+        let blocks = middle.chars().filter(|c| "█▀▄".contains(*c)).count();
+        assert!(blocks > 30, "WAVE 1 in pixels\n{screen}");
+    }
+
+    #[test]
+    fn elite_chips_carry_their_mark_and_masks_hide_letters() {
+        let mut game = locked_rock_game(Theme::Space, "comet");
+        let mut masked = game.rocks[0].clone();
+        masked.id = 7;
+        masked.word = "planet".into();
+        masked.kind = Kind::Masked;
+        masked.x = 20.0;
+        let mut split = masked.clone();
+        split.id = 8;
+        split.word = "zinc".into();
+        split.kind = Kind::Splitter;
+        split.x = 40.0;
+        split.y = 3.0;
+        game.rocks.push(masked);
+        game.rocks.push(split);
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("?"), "{screen}");
+        assert!(screen.contains("pl····"), "{screen}");
+        assert!(screen.contains("÷"), "{screen}");
+        assert!(screen.contains("zinc"), "{screen}");
+    }
+
+    #[test]
+    fn a_miss_names_the_key() {
+        let mut game = locked_rock_game(Theme::Underwater, "comet");
+        game.type_char('q');
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("‹q› expected \"o\""), "{screen}");
+    }
+
+    #[test]
+    fn scanlines_darken_every_other_row() {
+        let mut game = Game::new(80, 24, 7);
+        let bg = |game: &Game, y: u16| {
+            let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            t.draw(|f| draw(f, game)).unwrap();
+            t.backend().buffer()[(79, y)].bg
+        };
+        let (on2, on3) = (bg(&game, 2), bg(&game, 3));
+        game.settings.scanlines = false;
+        let (off2, off3) = (bg(&game, 2), bg(&game, 3));
+        assert_eq!(on2, off2, "even rows untouched");
+        assert_ne!(on3, off3, "odd rows darker");
+    }
+
+    #[test]
+    fn my_upgrades_screen_says_what_each_upgrade_does() {
+        use crate::upgrades::Upgrade;
+        let mut game = locked_rock_game(Theme::Space, "comet");
+        game.rocks.clear();
+        game.upgrades.set(Upgrade::SlowTide, 1);
+        game.upgrades.set(Upgrade::Multishot, 2);
+        game.open_shop_for_test();
+        game.input_lock = 0.0;
+        game.shop_toggle_rack();
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("MY UPGRADES"), "{screen}");
+        for (up, level) in [(Upgrade::SlowTide, 1), (Upgrade::Multishot, 2)] {
+            let name = up.tier(level).name;
+            assert!(screen.contains(name), "{name}\n{screen}");
+            let words: String = up.blurb(level).chars().take(20).collect();
+            assert!(screen.contains(&words), "describes {name}\n{screen}");
+        }
+        assert!(screen.contains("next: "), "shows the next card\n{screen}");
+        assert!(screen.contains("[ SELL ◆"), "{screen}");
+        assert!(screen.contains("[ BACK TO SHOP ]"), "{screen}");
+        assert!(!screen.contains("REROLL"), "replaces the shelf\n{screen}");
+    }
+
+    /// The first cell whose hit is `want`, after a render.
+    fn find_hit(w: u16, h: u16, want: Hit) -> Option<(u16, u16)> {
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .find(|&(x, y)| hit_at(x, y) == Some(want))
+    }
+
+    #[test]
+    fn menus_and_shop_record_where_the_mouse_can_click() {
+        let mut game = Game::new(80, 24, 1);
+        render(&game, 80, 24);
+        let at = find_hit(80, 24, Hit::Menu(1)).expect("title items are clickable");
+        assert_eq!(hit_at(at.0, at.1), Some(Hit::Menu(1)));
+        assert!(game.hover(Hit::Menu(1)));
+        assert_eq!(game.menu, 1);
+        assert!(!game.hover(Hit::Shop(0)), "no shop on the title");
+
+        let mut shop = locked_rock_game(Theme::Space, "comet");
+        shop.rocks.clear();
+        shop.upgrades.set(crate::upgrades::Upgrade::Focus, 1);
+        shop.open_shop_for_test();
+        render(&shop, 80, 24);
+        for hit in [
+            Hit::Shop(0),
+            Hit::Shop(2),
+            Hit::Shop(shop.shop_go_index()),
+            Hit::Loadout,
+        ] {
+            assert!(find_hit(80, 24, hit).is_some(), "{hit:?}");
+        }
+        shop.pause();
+        render(&shop, 80, 24);
+        let (x, y) = find_hit(80, 24, Hit::Menu(PAUSE_CONTINUE)).expect("pause menu");
+        assert_eq!(hit_at(x, y), Some(Hit::Menu(PAUSE_CONTINUE)));
+        assert!(
+            !shop.hover(Hit::Shop(0)),
+            "the shop under the pause is not live"
+        );
+    }
+
+    #[test]
+    fn the_shop_reports_the_wave_and_pause_shows_the_rack() {
+        let mut game = locked_rock_game(Theme::Space, "comet");
+        game.type_char('z');
+        game.rocks.clear();
+        game.upgrades.set(crate::upgrades::Upgrade::Focus, 1);
+        game.open_shop_for_test();
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("ACC"), "{screen}");
+        assert!(screen.contains("WPM"), "{screen}");
+        assert!(screen.contains("tab for details"), "{screen}");
+        assert!(screen.contains("[ MY UPGRADES ]"), "{screen}");
+        game.pause();
+        let paused = render(&game, 80, 24);
+        assert!(paused.contains("PAUSED"), "{paused}");
+        assert!(paused.contains("RACK 1/6"), "{paused}");
+    }
+
+    #[test]
+    fn initials_and_victory_have_their_own_screens() {
+        let mut game = locked_rock_game(Theme::Jungle, "comet");
+        game.phase = Phase::Initials;
+        game.type_char('a');
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("NEW HIGH SCORE"), "{screen}");
+        assert!(screen.contains("enter confirms"), "{screen}");
+
+        game.phase = Phase::Victory;
+        game.menu = 0;
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("ENDLESS"), "{screen}");
+        assert!(screen.contains("FINISH RUN"), "{screen}");
+    }
+
+    #[test]
+    fn the_floor_line_is_the_overdrive_meter() {
+        let mut game = locked_rock_game(Theme::CatCafe, "comet");
+        game.drive = 30.0;
+        let screen = render(&game, 80, 24);
+        let floor = screen.lines().nth(21).unwrap();
+        let filled = floor.chars().filter(|&c| c == '━').count();
+        assert!((38..=42).contains(&filled), "half full\n{floor}");
+        game.drive = 60.0;
+        let screen = render(&game, 80, 24);
+        assert!(screen.contains("TAB » OVERDRIVE"), "{screen}");
     }
 }

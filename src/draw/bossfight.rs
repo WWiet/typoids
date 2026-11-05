@@ -253,7 +253,10 @@ fn status_line(buf: &mut Buffer, game: &Game, b: &Boss, pal: &Palette, at: (i32,
     let mut x = 2;
     put(buf, x, y, name, style(pal.amber).add_modifier(bold));
     x += name.chars().count() as i32 + 2;
-    let len = (((w - x - 24) / 2).clamp(6, 16)) as usize;
+    let pace = format!("{} / {} WPM", b.live_wpm(), b.wpm);
+    // Room for "HP ", " TIME ", the seconds and the pace readout.
+    let fixed = 3 + 1 + 5 + 1 + 4 + 2 + pace.chars().count() as i32 + 2;
+    let len = ((w - x - fixed) / 2).clamp(3, 16) as usize;
 
     put(buf, x, y, "HP", style(pal.dim));
     put(
@@ -285,7 +288,6 @@ fn status_line(buf: &mut Buffer, game: &Game, b: &Boss, pal: &Palette, at: (i32,
         style(clock).add_modifier(bold),
     );
 
-    let pace = format!("{} / {} WPM", b.live_wpm(), b.wpm);
     let pace_col = if b.live_wpm() >= b.wpm {
         pal.hot
     } else {
@@ -295,21 +297,49 @@ fn status_line(buf: &mut Buffer, game: &Game, b: &Boss, pal: &Palette, at: (i32,
     put(buf, px, y, &pace, style(pace_col).add_modifier(bold));
 }
 
-/// Wrap the passage into lines of word indices.
-fn wrap_words(words: &[&str], width: usize) -> Vec<(usize, usize)> {
+/// Wrap the passage into lines of word indices, given each word's width.
+fn wrap_words(widths: &[usize], width: usize) -> Vec<(usize, usize)> {
     let mut lines = Vec::new();
     let (mut start, mut used) = (0, 0);
-    for (i, w) in words.iter().enumerate() {
-        let need = w.len() + usize::from(used > 0);
+    for (i, &w) in widths.iter().enumerate() {
+        let need = w + usize::from(used > 0);
         if used + need > width && used > 0 {
             lines.push((start, i));
             start = i;
             used = 0;
         }
-        used += w.len() + usize::from(used > 0);
+        used += w + usize::from(used > 0);
     }
-    lines.push((start, words.len()));
+    lines.push((start, widths.len()));
     lines
+}
+
+/// The word being typed, letter by letter: clean letters bright, typos red
+/// (showing the letter that was wanted), extras past the end red, and the
+/// untyped rest underlined. Returns the width drawn.
+fn current_word(
+    buf: &mut Buffer,
+    word: &str,
+    typed: &str,
+    at: (i32, i32),
+    look: (Style, &Palette),
+) -> i32 {
+    let (x, y) = at;
+    let (fill, pal) = look;
+    let (wb, tb) = (word.as_bytes(), typed.as_bytes());
+    let len = wb.len().max(tb.len());
+    for k in 0..len {
+        let (ch, st) = match (wb.get(k), tb.get(k)) {
+            (Some(&w), Some(&t)) if w == t => (w, fill.fg(pal.hot)),
+            (Some(&w), Some(_)) => (w, fill.fg(pal.danger)),
+            (None, Some(&t)) => (t, fill.fg(pal.danger)),
+            (Some(&w), None) => (w, fill.fg(pal.ink).add_modifier(Modifier::UNDERLINED)),
+            (None, None) => continue,
+        };
+        let text = (ch as char).to_string();
+        put(buf, x + k as i32, y, &text, st.add_modifier(Modifier::BOLD));
+    }
+    len as i32
 }
 
 fn passage_panel(buf: &mut Buffer, game: &Game, b: &Boss, pal: &Palette, at: (i32, i32, i32)) {
@@ -325,7 +355,7 @@ fn passage_panel(buf: &mut Buffer, game: &Game, b: &Boss, pal: &Palette, at: (i3
         let lines = [
             format!("BOSS FIGHT  ·  {} WPM", b.wpm),
             format!(
-                "{} words in {}s  ·  wrong keys hurt",
+                "{} words in {}s  ·  space between words  ·  fix typos",
                 b.words.len(),
                 b.limit.ceil()
             ),
@@ -345,7 +375,20 @@ fn passage_panel(buf: &mut Buffer, game: &Game, b: &Boss, pal: &Palette, at: (i3
         return;
     }
 
-    let lines = wrap_words(&b.words, (panel_w - 4) as usize);
+    let typed = game.buffer.as_str();
+    let widths: Vec<usize> = b
+        .words
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            if i == b.idx {
+                w.len().max(typed.len())
+            } else {
+                w.len()
+            }
+        })
+        .collect();
+    let lines = wrap_words(&widths, (panel_w - 4) as usize);
     let cur = lines
         .iter()
         .position(|&(a, z)| b.idx >= a && b.idx < z)
@@ -356,7 +399,6 @@ fn passage_panel(buf: &mut Buffer, game: &Game, b: &Boss, pal: &Palette, at: (i3
     } else {
         cur
     };
-    let missed = game.miss > 0.0;
     for r in 0..rows as usize {
         let Some(&(a, z)) = lines.get(first + r) else {
             break;
@@ -365,27 +407,11 @@ fn passage_panel(buf: &mut Buffer, game: &Game, b: &Boss, pal: &Palette, at: (i3
         for i in a..z {
             let word = b.words[i];
             if i == b.idx {
-                let typed = game.buffer.len().min(word.len());
-                let hot = if missed { pal.danger } else { pal.hot };
-                put(
-                    buf,
-                    x,
-                    top + r as i32,
-                    &word[..typed],
-                    fill.fg(hot).add_modifier(Modifier::BOLD),
-                );
-                put(
-                    buf,
-                    x + typed as i32,
-                    top + r as i32,
-                    &word[typed..],
-                    fill.fg(pal.ink)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                );
-            } else {
-                let col = if i < b.idx { pal.faint } else { pal.dim };
-                put(buf, x, top + r as i32, word, fill.fg(col));
+                x += current_word(buf, word, typed, (x, top + r as i32), (fill, pal)) + 1;
+                continue;
             }
+            let col = if i < b.idx { pal.faint } else { pal.dim };
+            put(buf, x, top + r as i32, word, fill.fg(col));
             x += word.len() as i32 + 1;
         }
     }

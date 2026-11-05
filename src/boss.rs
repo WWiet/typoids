@@ -1,8 +1,10 @@
 //! Boss waves: a timed typing test instead of a field of hazards.
 //!
-//! Every fifth wave the player faces a passage of words and a clock. Typing
-//! well drains the boss, a wrong key makes it strike, and running out of time
-//! costs hearts. Pure data and math; `game.rs` runs the encounter.
+//! Every fifth wave the player faces a passage of words and a clock, played
+//! like Monkeytype: space moves on to the next word, but only once the word is
+//! spelled right, so typos have to be fixed. Mistakes cost time, not hearts;
+//! running out of time (missing the pace) ends the run. Pure data and math;
+//! `game.rs` runs the encounter.
 
 use crate::game::Theme;
 use crate::words;
@@ -11,8 +13,18 @@ use crate::words;
 pub const EVERY: u32 = 5;
 /// Seconds of warning before the clock starts.
 pub const INTRO: f32 = 3.0;
-/// Hearts lost when the clock runs out.
-pub const TIMEOUT_HEARTS: u32 = 2;
+/// Wrong letters typed past the end of a word, at most.
+pub const MAX_EXTRA: usize = 6;
+/// How many letters at the start of `typed` match `word`: the letters that
+/// count toward the pace. Everything after the first typo does not.
+pub fn clean_len(word: &str, typed: &str) -> usize {
+    word.bytes()
+        .zip(typed.bytes())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+/// Beating this boss (wave 20, 100 WPM) wins the run.
+pub const FINAL_TIER: u32 = 4;
 
 pub fn is_boss_wave(wave: u32) -> bool {
     wave > 0 && wave / EVERY * EVERY == wave
@@ -70,9 +82,11 @@ pub struct Boss {
     pub words: Vec<&'static str>,
     /// Index of the word being typed.
     pub idx: usize,
-    /// Correct characters so far; a finished word also counts its space,
-    /// matching how typing tests count.
+    /// Characters that count so far: finished words with their spaces, plus
+    /// the clean start of the current word, as typing tests count.
     pub chars_done: usize,
+    /// Characters of the finished words, spaces included.
+    pub banked: usize,
     pub chars_total: usize,
     pub wpm: u32,
     /// Seconds allowed, from the target pace.
@@ -118,6 +132,7 @@ impl Boss {
             words,
             idx: 0,
             chars_done: 0,
+            banked: 0,
             chars_total,
             wpm,
             limit: chars_total as f32 / 5.0 / wpm as f32 * 60.0,
@@ -128,6 +143,31 @@ impl Boss {
             outcome: None,
             outcome_t: 0.0,
         }
+    }
+
+    /// Demand a different pace; the clock is recomputed to match.
+    pub fn set_wpm(&mut self, wpm: u32) {
+        self.wpm = wpm.max(1);
+        self.limit = self.chars_total as f32 / 5.0 / self.wpm as f32 * 60.0;
+    }
+
+    /// Recount after the typed text changes.
+    pub fn sync(&mut self, typed: &str) {
+        let live = self.word().map_or(0, |w| clean_len(w, typed));
+        self.chars_done = self.banked + live;
+    }
+
+    /// The current word is done (with its space): move to the next.
+    pub fn bank(&mut self) {
+        let len = self.word().map_or(0, str::len);
+        self.banked += len + 1;
+        self.idx += 1;
+        self.chars_done = self.banked;
+    }
+
+    /// True on the passage's final word, which ends without a space.
+    pub fn on_last_word(&self) -> bool {
+        self.idx + 1 == self.words.len()
     }
 
     pub fn active(&self) -> bool {

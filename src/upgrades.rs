@@ -51,7 +51,6 @@ pub enum Upgrade {
     Multishot,
     Ward,
     Interest,
-    Alliteration,
     SecondWind,
     Focus,
     BigGame,
@@ -68,9 +67,11 @@ pub enum Upgrade {
     Sweeper,
     Discount,
     WideShop,
+    Overclock,
+    Afterburn,
 }
 
-pub const COUNT: usize = 26;
+pub const COUNT: usize = 27;
 
 /// One level of a line: the card the shop shows for it.
 pub struct Tier {
@@ -108,12 +109,12 @@ const fn def(key: &'static str, desc: &'static str, tiers: &'static [Tier]) -> D
 const DEFS: [Def; COUNT] = [
     def(
         "steadyhands",
-        "Words with no slips: more score and crystals.",
+        "Words with no slips: more score and +1 crystal.",
         &[t("STEADY HANDS", C), t("IRON NERVES", U), t("METRONOME", R)],
     ),
     def(
         "prospector",
-        "Every kill drops more crystals.",
+        "Kills may drop an extra crystal.",
         &[
             t("PROSPECTOR", C),
             t("GOLD PAN", C),
@@ -171,11 +172,6 @@ const DEFS: [Def; COUNT] = [
         "interest",
         "Earn 1 crystal per 5 held after each wave (max 5).",
         &[t("INTEREST", R)],
-    ),
-    def(
-        "alliteration",
-        "Same first letter twice in a row: 2x score, +1 crystal.",
-        &[t("ALLITERATION", R)],
     ),
     def(
         "secondwind",
@@ -249,7 +245,7 @@ const DEFS: [Def; COUNT] = [
     ),
     def(
         "sweeper",
-        "Every 20th kill detonates every hazard on screen.",
+        "Every 25th word you type detonates every hazard.",
         &[t("SWEEPER", R)],
     ),
     def(
@@ -261,6 +257,16 @@ const DEFS: [Def; COUNT] = [
         "wideshop",
         "The shop offers a fourth card.",
         &[t("WIDE SHOP", R)],
+    ),
+    def(
+        "overclock",
+        "The Overdrive meter fills 30% faster.",
+        &[t("OVERCLOCK", U)],
+    ),
+    def(
+        "afterburn",
+        "Overdrive lasts 2 seconds longer.",
+        &[t("AFTERBURN", R)],
     ),
 ];
 
@@ -275,7 +281,6 @@ impl Upgrade {
         Upgrade::Multishot,
         Upgrade::Ward,
         Upgrade::Interest,
-        Upgrade::Alliteration,
         Upgrade::SecondWind,
         Upgrade::Focus,
         Upgrade::BigGame,
@@ -292,6 +297,8 @@ impl Upgrade {
         Upgrade::Sweeper,
         Upgrade::Discount,
         Upgrade::WideShop,
+        Upgrade::Overclock,
+        Upgrade::Afterburn,
     ];
 
     pub fn def(self) -> &'static Def {
@@ -348,49 +355,102 @@ impl Upgrade {
         2 * level as u32
     }
 
+    /// Chance per kill of one extra crystal under Prospector.
+    pub fn prospector_chance(level: u8) -> f32 {
+        (0.2 * level as f32).min(1.0)
+    }
+
+    /// Overdrive charge per clean letter under Overclock.
+    pub fn drive_rate(level: u8) -> f32 {
+        1.0 + 0.3 * level as f32
+    }
+
+    /// Extra seconds of Overdrive under Afterburn.
+    pub fn afterburn_secs(level: u8) -> f32 {
+        2.0 * level as f32
+    }
+
+    /// Card text for lines whose numbers scale: a template with `{}` where
+    /// the number goes, and the number at a given level.
+    fn scaling(self, level: u8) -> Option<(&'static str, String)> {
+        let n = level as u32;
+        let pct = |f: f32| format!("{}%", (f * 100.0).round());
+        Some(match self {
+            Upgrade::SteadyHands => (
+                "Words with no slips: +{} score, +1 crystal.",
+                format!("{}%", 25 * n),
+            ),
+            Upgrade::Prospector => (
+                "Kills have a {} chance of one extra crystal.",
+                pct(Self::prospector_chance(level)),
+            ),
+            Upgrade::SlowTide => ("Hazards drift {} slower.", format!("{}%", 10 * n)),
+            Upgrade::LongFuse => ("Combos last {} longer.", format!("{}s", 1.5 * n as f32)),
+            Upgrade::Ward => (
+                "Wards each wave: {}. A ward absorbs one hit.",
+                n.to_string(),
+            ),
+            Upgrade::Multishot => (
+                "Kills also pop the nearest word of {} letters or fewer.",
+                Self::multishot_letters(level).to_string(),
+            ),
+            Upgrade::Scattershot => ("Multishot pops {} words per kill.", (1 + n).to_string()),
+            Upgrade::Focus => (
+                "The word you type slows to {} speed.",
+                pct(Self::focus_pace(level)),
+            ),
+            Upgrade::BrakePads => (
+                "Hazards crawl for the first {} of each wave.",
+                format!("{}s", Self::brake_secs(level)),
+            ),
+            Upgrade::LuckyPenny => (
+                "{} of kills drop double crystals.",
+                pct(Self::lucky_chance(level)),
+            ),
+            Upgrade::Shrapnel => (
+                "Kills shove hazards within {} cells away.",
+                Self::shrapnel_radius(level).to_string(),
+            ),
+            Upgrade::Recycler => (
+                "Each reroll refunds {} crystals.",
+                Self::recycler_refund(level).to_string(),
+            ),
+            Upgrade::Discount => (
+                "Shop prices are {} lower (never below 1).",
+                Self::discount_off(level).to_string(),
+            ),
+            _ => return None,
+        })
+    }
+
     /// Card text for the level you would have after buying. Lines that scale
     /// spell out their next step; the rest use the fixed description.
     pub fn blurb(self, next_level: u8) -> String {
         let l = next_level.clamp(1, self.max());
-        let n = l as u32;
-        match self {
-            Upgrade::SteadyHands => {
-                format!("Words with no slips: +{}% score, +{n} crystals.", 25 * n)
-            }
-            Upgrade::Prospector => format!("Every kill drops {n} extra crystal{}.", plural(n)),
-            Upgrade::SlowTide => format!("Hazards drift {}% slower.", 10 * n),
-            Upgrade::LongFuse => format!("Combos last {}s longer.", 1.5 * n as f32),
-            Upgrade::Ward => format!("Absorb {n} hit{} at the start of each wave.", plural(n)),
-            Upgrade::Multishot => format!(
-                "Kills also pop the nearest word of {} letters or fewer.",
-                Self::multishot_letters(l)
-            ),
-            Upgrade::Scattershot => format!("Multishot pops {} words per kill.", 1 + n),
-            Upgrade::Focus => format!(
-                "The word you type slows to {}% speed.",
-                (Self::focus_pace(l) * 100.0).round()
-            ),
-            Upgrade::BrakePads => format!(
-                "Hazards crawl for the first {} seconds of each wave.",
-                Self::brake_secs(l)
-            ),
-            Upgrade::LuckyPenny => format!(
-                "{}% of kills drop double crystals.",
-                (Self::lucky_chance(l) * 100.0).round()
-            ),
-            Upgrade::Shrapnel => format!(
-                "Kills shove hazards within {} cells away.",
-                Self::shrapnel_radius(l)
-            ),
-            Upgrade::Recycler => {
-                format!("Each reroll refunds {} crystals.", Self::recycler_refund(l))
-            }
-            Upgrade::Discount => format!(
-                "Shop prices are {} lower (never below 1).",
-                Self::discount_off(l)
-            ),
-            _ => self.def().desc.to_string(),
+        match self.scaling(l) {
+            Some((template, value)) => template.replacen("{}", &value, 1),
+            None => self.def().desc.to_string(),
         }
+    }
+
+    /// Card text for buying the next level while holding `held`: scaling
+    /// lines show the step, as in "Hazards drift 20% → 30% slower."
+    pub fn blurb_delta(self, held: u8) -> String {
+        let next = (held + 1).min(self.max());
+        match (held, self.scaling(held), self.scaling(next)) {
+            (1.., Some((template, was)), Some((_, now))) => {
+                template.replacen("{}", &format!("{was} → {now}"), 1)
+            }
+            _ => self.blurb(next),
+        }
+    }
+
+    /// Crystals refunded for selling a line held at `level`.
+    pub fn sell_value(self, level: u8) -> u32 {
+        if level == 0 {
+            return 0;
+        }
+        (self.cost(level - 1) / 2).max(1)
     }
 
     /// Crystals needed to buy the card at `owned + 1` before any discount.
@@ -399,14 +459,6 @@ impl Upgrade {
             return 8;
         }
         self.tier(owned + 1).rarity.base_cost() + owned as u32 * 2
-    }
-}
-
-fn plural(n: u32) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
     }
 }
 
@@ -439,11 +491,67 @@ impl Upgrades {
         self.0[up as usize] = level.min(up.max());
     }
 
+    /// Levels held across every line (drives shop inflation).
+    pub fn total_levels(&self) -> u32 {
+        self.0.iter().map(|&l| l as u32).sum()
+    }
+
+    /// Lines with at least one level (each takes a rack slot).
+    pub fn lines_held(&self) -> u32 {
+        self.0.iter().filter(|&&l| l > 0).count() as u32
+    }
+
     /// Held upgrades in catalog order, with their levels.
     pub fn held(&self) -> impl Iterator<Item = (Upgrade, u8)> + '_ {
         Upgrade::ALL
             .into_iter()
             .filter(|&u| self.has(u))
             .map(|u| (u, self.level(u)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaling_cards_show_the_step_they_buy() {
+        assert_eq!(
+            Upgrade::SlowTide.blurb_delta(2),
+            "Hazards drift 20% → 30% slower."
+        );
+        assert_eq!(
+            Upgrade::SlowTide.blurb_delta(0),
+            "Hazards drift 10% slower."
+        );
+        assert_eq!(Upgrade::Haggler.blurb_delta(0), Upgrade::Haggler.def().desc);
+    }
+
+    #[test]
+    fn card_text_stays_short_enough_for_a_card() {
+        for up in Upgrade::ALL {
+            for held in 0..up.max() {
+                let text = up.blurb_delta(held);
+                assert!(text.chars().count() <= 62, "{text}");
+            }
+            for level in 1..=up.max() {
+                assert!(up.tier(level).name.chars().count() <= 12);
+            }
+        }
+    }
+
+    #[test]
+    fn motherlode_is_a_sure_thing_not_a_fortune() {
+        assert_eq!(Upgrade::prospector_chance(5), 1.0);
+        assert!(Upgrade::prospector_chance(1) < 0.25);
+    }
+
+    #[test]
+    fn selling_refunds_half_the_last_price() {
+        assert_eq!(
+            Upgrade::SlowTide.sell_value(1),
+            Upgrade::SlowTide.cost(0) / 2
+        );
+        assert_eq!(Upgrade::SlowTide.sell_value(0), 0);
     }
 }

@@ -38,14 +38,24 @@ There is no separate lint config and no CI; `-D warnings` is the standard.
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Terminal setup, frame-paced event loop, key handling per phase. |
-| `src/game.rs` | Simulation: state machine, hazards, typing buffer, scoring, effects, RNG, theme list, tests. |
+| `src/main.rs` | Terminal setup, frame-paced event loop, key and mouse handling per phase. |
+| `src/game.rs` | Simulation: state machine, hazards, typing buffer, scoring, effects, RNG, theme list, tests (including the balance bot). |
+| `src/game/arcade.rs` | Call-outs, combo announcer, odometer, typing `Stats`, high-score/initials flow, victory, heat, options, help, attract mode, daily run. |
+| `src/game/fun.rs` | Overdrive, hit-stop, word links, elite behavior (crack, split), power-ups. |
+| `src/game/pointer.rs` | Mouse targets (`Hit`) and `hover()`, which selects one only if its screen is up. |
+| `src/game/rack.rs` | Rack slots and selling, shop inflation, flawless bonus, `hazard_pace()`. |
+| `src/audio.rs` | Sound: `Sfx` list, synthesized recipes, the `Mixer`, and the thread that streams PCM to `pw-cat`/`pacat`/`aplay`. |
+| `src/hazards.rs` | Elite `Kind`s, the `ELITES` table, `Pickup`s. Data only. |
+| `src/scores.rs` | High-score table and daily best: pure `encode`/`decode`, `date_label`. |
+| `src/settings.rs` | `Settings` (scanlines, shake, reduced motion, heat): pure `encode`/`decode`. |
 | `src/draw.rs` | All rendering: palettes, background, braille ink layer, ships, hazards, effects, HUD, menus, render tests. |
 | `src/boss.rs` | Boss-wave rules: cadence, WPM targets, passage and clock (`Boss`). Data and math only. |
 | `src/draw/bossfight.rs` | The boss art, its HP/clock/pace bar, and the passage panel. |
 | `src/draw/ships.rs` | The four player craft (`Craft` helper plus one function per theme). |
-| `src/draw/stage.rs` | The typing stage: big pixel letters along the bottom, with slide, assemble and shatter animations. |
-| `src/draw/bigfont.rs` | 5x7 capital-letter pixel font for the stage. Data only. |
+| `src/draw/stage.rs` | The typing stage: big pixel letters along the bottom, with slide, assemble and shatter animations, and the floor line that doubles as the Overdrive meter. |
+| `src/draw/bigtext.rs` | Pixel `Grid`, half-block `blit`, `draw_text` and `noise`, shared by the stage and the call-outs. |
+| `src/draw/arcade.rs` | Attract-mode title (marquee, menu, hi-scores, options, help), call-outs, announcer, initials screen. |
+| `src/draw/bigfont.rs` | 5x7 pixel font: capitals, digits and `! ? : - .`. Data only. |
 | `src/upgrades.rs` | Roguelike upgrade catalog: `Upgrade`, `Rarity`, `Upgrades` (levels held), costs. Data only. |
 | `src/save.rs` | `RunSave` plus pure `encode`/`decode` for the run save file. |
 | `src/words.rs` | Lowercase ASCII word pools (`SHORT`, `MID`, `LONG`). |
@@ -63,21 +73,40 @@ are siblings and may use `crate::game::...`, `crate::draw::...`, etc.
   `update(0.0)` while paused and bumps `game.time` separately for blinking.
 - `Game::set_screen` recomputes the play area and reseeds background particles
   when the terminal size changes. It is safe to call every frame.
-- Phases are `Title`, `Playing`, `Paused`, `Shop`, `Dying`, `GameOver`.
+- Phases are `Title`, `Playing`, `Paused`, `Shop`, `Dying`, `Initials`,
+  `Victory`, `GameOver`. `Dying` ends in `finish_run()`, which goes to
+  `Initials` when the score makes the table, otherwise `GameOver`.
+- `pause()` works from `Playing` and from `Shop`; `paused_from` remembers
+  which, `resume()` returns there, and `in_shop()` is true for a shop under
+  the pause menu. Esc in the shop pauses; it never quits.
+- `Shop`, `GameOver`, `Initials` and `Victory` ignore keys for `MENU_LOCK`
+  seconds after they appear (`input_lock`, checked through
+  `accepts_menu_keys()` in `main.rs`), so a typist mid-word never buys,
+  skips or restarts by accident.
+- Each normal wave opens with a `READY` beat: the "WAVE n" and "GO!"
+  call-outs play, typing is ignored, then the first three hazards arrive.
+  Tests that type straight after `start()` call `skip_ready_for_test()`.
 - Pause menu **Save & Quit** (`PAUSE_QUIT`) and `Q` during pause or the shop
   call `Game::save_and_quit_to_title()`, which writes the run then calls
   `return_to_title()`. Title and game-over Quit still set `game.quit`.
-- Menu indices are shared between the title, pause, and game-over popups, but
-  each popup has its own item list (`MENU_ITEMS`, `PAUSE_ITEMS`, `OVER_ITEMS`)
-  and constants (`MENU_START`, `PAUSE_CONTINUE`, `OVER_AGAIN`, ...). When you
-  change a list, update the matching `main.rs` key handling and the tests.
+- Menu indices are shared between the title, pause, game-over and victory
+  popups, but each has its own item list (`MENU_ITEMS`, `PAUSE_ITEMS`,
+  `OVER_ITEMS`, `VICTORY_ITEMS`) and constants (`MENU_START`,
+  `PAUSE_CONTINUE`, `OVER_AGAIN`, `VICTORY_ENDLESS`, ...). The title list is
+  vertical; key handling asks `title_action()`. When you change a list,
+  update the matching `main.rs` key handling and the tests. `main.rs` uses
+  `nav_delta()` for h/j/k/l and arrows everywhere.
 - The applied theme is `game.theme`; the highlighted menu choice is
   `game.theme_choice`. Only `apply_theme()` copies choice into theme.
 - Hazards are `Rock` values with a circular word label, live flag, hit flash,
   and a polygonal `shape`. Coconuts are rounder and denser than asteroids.
 - Typing uses `game.buffer`. Correct letters extend the buffer; wrong letters
-  are ignored; backspace removes one letter. A hazard is locked when its word
-  starts with the buffer.
+  are ignored (`slip()` records `last_wrong` for the miss line); backspace
+  removes one letter and Ctrl+W (`clear_word()`) the whole word. A hazard is
+  locked when its word starts with the buffer.
+- Difficulty comes from `hazard_speed(wave)` (logarithmic, levels off),
+  `spawn_gap(wave)`, `word_mix(wave)` (long words ramp in from wave 6) and
+  the elite table, not from raw speed. Retune with the balance bot below.
 - Word pools must remain lowercase ASCII, unique, and typeable on a normal
   keyboard. `pool()` escalates from short to mid to long words by wave.
 - RNG is a small deterministic LCG (`Rng`): use `self.rng.range`, `self.rng.f32`,
@@ -98,7 +127,8 @@ in a three-card shop that opens after every cleared wave (`Phase::Shop`).
   never touches typing state. A bought card stays sold: the next tier has to
   roll in on a later shop or reroll. Menu indices come from `shop_slots()`,
   `shop_reroll_index()` and `shop_go_index()`, never constants. Shop keys live
-  in `main.rs`: `h`/`l`, `1`-`4`, `r`, `Enter`, `space`.
+  in `main.rs`: `h`/`l`, `1`-`4`, `r`, `Enter`, `space`, `Tab` (rack and
+  selling), `Esc` (pause), `q` (save and quit).
 - **Lines and tiers.** `upgrades.rs` holds the catalog. An `Upgrade` is a line
   of cards; every level is its own card (`Def::tiers`: name and rarity), so
   Slow Tide, Deep Current and Still Water are three cards in one line. The
@@ -119,16 +149,93 @@ in a three-card shop that opens after every cleared wave (`Phase::Shop`).
   `key` and level, so never rename a key or reorder tiers.
 - **Rarity and cost.** Rare cards should be rule-benders, not bigger numbers.
   Later tiers of a line are usually rarer than earlier ones. A card costs
-  `Rarity::base_cost` of its tier plus 2 per level already held; patch kits are
-  flat, and Discount lowers every price (never below 1). An upgrade that only
+  `Rarity::base_cost` of its tier plus 2 per level already held, plus
+  `inflation()` (one per two tiers held across the run); patch kits are flat,
+  and Discount lowers every price (never below 1). An upgrade that only
   improves another must gate itself in `eligible`.
+- **Card text.** Scaling lines describe themselves through
+  `Upgrade::scaling(level)` (a template with `{}` plus the number), so
+  `blurb` and the shop's `blurb_delta` ("20% → 30%") stay in step with the
+  helpers. Add new scaling lines there.
+- **The rack.** A run holds `rack_size()` lines (6, +1 per boss beaten, max
+  10; `rack_bonus` in the save). Buying a new line on a full rack fails with a
+  note; upgrading an owned line needs no slot. In the shop, Tab (or the
+  MY UPGRADES button) toggles `rack_focus`, which swaps the cards for the
+  upgrades screen (`draw_loadout`: every held line with its card name, pips,
+  `blurb(level)`, the next card and its sell price). `shop_sell()` refunds
+  `Upgrade::sell_value` and resets any shelf card of that line to tier 1.
+- **Economy.** `detonate(.., chained)`: kills by Multishot, Scattershot,
+  Sweeper and Nuke drop one crystal and skip per-kill bonuses and typing
+  streaks. Prospector is a chance (`prospector_chance`), Steady Hands adds one
+  crystal at any level, Sweeper fires every `SWEEP_EVERY` typed kills, and a
+  wave cleared without losing a heart pays `flawless_bonus()`.
+- **Pace.** All hazard speed modifiers live in `hazard_pace()`: Slow Tide and
+  Last Stand share a floor of 0.5, then Brake Pads, Overdrive, Freeze and
+  heat multiply. Focus is applied per target in `integrate_rocks`.
 - **Saves.** `~/.typoids-run` holds a `RunSave` (wave, score, lives, crystals,
   kills, revive flag, upgrades, and whether to resume in the shop). It is
-  written when the shop opens, after each purchase or reroll, and by
-  Save & Quit; it is deleted when a run ends or a new one starts. A mid-wave
+  written when the shop opens, after each purchase, sale or reroll, at the
+  victory screen, and by Save & Quit; it is deleted when a run ends or a new
+  one starts. It also stores `rack`, `heat`, `typed`, `daily` and `won`; old
+  saves decode with defaults. A mid-wave
   save resumes at the start of that wave. **Tests never write it:** only
   `main.rs` calls `enable_persistence()`, so `persist` is off in `Game::new`.
   Test save logic through `snapshot`/`load_run` and `save::encode`/`decode`.
+
+## Arcade layer
+
+`src/game/arcade.rs` and `src/draw/arcade.rs`.
+
+- **Call-outs.** `callout(text, delay, dur)` queues big pixel text
+  (`active_callout()` is the newest started one). Used for WAVE n / GO!,
+  CLEAR!, WARNING, K.O.!, TIME UP, GAME OVER, YOU WIN!, OVERDRIVE!
+  and pickups. The `banner` becomes the call-out's subtitle. Warning-type
+  call-outs use the danger gradient (`alarming` in `draw/arcade.rs`).
+- **Announcer.** `announce_combo(before)` fires on crossing a
+  `COMBO_CALLS` milestone; drawn as spaced text on play row 1.
+- **Odometer.** The header shows `shown_score`/`shown_crystals`, rolled by
+  `tick_counters`. Call `snap_counters()` after setting score or crystals
+  directly (load, tests).
+- **Stats.** `note_key(ok)` feeds `wave_stats` and `run_stats` (accuracy,
+  WPM over typing time only, best combo). The shop heading, pause and
+  game-over popups show `Stats::summary()`.
+- **Scores.** `~/.typoids-scores` (`scores.rs`) keeps five entries and the
+  daily best. `finish_run()` records the daily score and routes to
+  `Initials`; `confirm_initials()` files the entry. The old
+  `~/.typoids-best` is still the HI number.
+- **Victory.** Beating the `boss::FINAL_TIER` boss sets `finale`; after the
+  clear the run enters `Victory` (unlocks the next heat). ENDLESS opens the
+  shop, FINISH RUN calls `finish_run()`. `won` marks the run and the entry.
+- **Heat.** `settings.heat` (picked with h/l on START, capped by
+  `heat_unlocked`) becomes `game.heat` at `start()`. Rules are cumulative
+  and checked with `heat_rule(n)`; text lives in `HEAT_RULES`.
+- **Settings and title.** `settings.rs` holds scanlines, shake, reduced
+  motion and heat; only `enable_persistence()` loads or writes it. A missing
+  file means first launch: the help card opens. The title shows the
+  hi-score table when `attract_table()` (idle since `last_input`, which
+  `main.rs` bumps on every key).
+- **Daily run.** `main.rs` passes the day number (`set_day`);
+  `start_daily()` seeds the RNG from it, rotates the theme by day, plays at
+  heat 0 and sets `daily`.
+
+## Abilities and elites
+
+`src/game/fun.rs`, data in `src/hazards.rs`.
+
+- **Overdrive.** Clean letters charge `drive` (Overclock speeds it, slips
+  drain it); Tab calls `activate_overdrive()` when `drive_ready()`. While
+  `overdrive > 0` hazards move at `OVERDRIVE_PACE`, combo steps by two, the
+  palette is tinted (`Palette::tinted`), and on boss waves `boss_hold`
+  stops the clock. The stage floor line is the meter (`stage::draw_floor`).
+- **Hit-stop.** `hit_stop(secs)` freezes world time in `update` (effects
+  keep fading); `kill_weight` sets it per kill. Skipped with reduced motion.
+- **Links.** `update_link` on typed kills; `link_bonus` scales score;
+  `extends_link(word)` drives the chip's link ring.
+- **Elites.** `roll_kind()` reads `ELITES` and `GOLDEN_ONE_IN`; kinds are
+  data (`Kind::speed`, `Kind::mark`). Armored: `crack()` absorbs the first
+  completion. Splitter and Golden act in `on_kill` (`split`,
+  `grant_pickup`). Masked words hide letters past `MASK_SHOWN` on the chip
+  until locked. Mark them on the chip only, never with extra geometry.
 
 ## Boss waves
 
@@ -141,19 +248,25 @@ test. `begin_wave` calls `start_boss`, which sets `Game::boss`; while it is
   `chars / 5 / wpm * 60` seconds, counting a space after every word as typing
   tests do. A three-second intro (`INTRO`) lets the player read; keys do nothing
   until it ends and the clock starts afterwards.
-- **Typing.** `type_char` routes to `boss_type`. The buffer only ever holds the
-  correct start of the current word and finishing the word advances at once (no
-  space key). `target_word()` returns the current word, so the stage draws it
-  big with the normal slide and assemble animations. Backspace is disabled.
-- **Damage.** A wrong key calls `boss_miss`: Clean Slate forgives the first
-  slip each wave, a Ward absorbs one, otherwise `lose_life(0.7)` costs a heart
-  with a short grace period so a burst of slips is one hit. The correct letters
-  stay in the buffer. `lose_life` is shared with hazard collisions.
+- **Typing (Monkeytype rules).** `type_char` routes to `boss_type`: every
+  letter enters the buffer, right or wrong, up to `MAX_EXTRA` past the word's
+  end. Wrong letters are `slip`s (red, accuracy, Overdrive drain) and stay
+  until Backspace or Ctrl+W removes them. Space (`type_space`, bound in
+  `main.rs`) banks the word only when the buffer equals it; a space on a typo
+  is refused as a slip with `last_wrong = ' '`, a leading space is ignored.
+  The passage's last word ends on its last letter, no space. Only the clean
+  start of the word counts: `Boss::sync` keeps `chars_done` at `banked` plus
+  `clean_len`, so call `sync_boss()` after any buffer change. Only clean
+  letters and spaces fire lasers. `target_word()` returns the current word;
+  the stage and passage panel color each typed letter by whether it matches.
+- **Damage.** Mistakes never cost hearts against the boss; they only cost
+  time (and accuracy). Ward and Clean Slate therefore do nothing there.
 - **Outcomes.** Finishing the passage (`boss_win`) pays `12 + 8 * tier`
-  crystals, score by tier and pace, and heals one heart. Running out of time
-  (`boss_timeout`) costs `TIMEOUT_HEARTS` (2) hearts and pays nothing; if that
-  empties the hearts the normal death sequence runs. Both reuse the
-  `pending_clear` path into the shop, which clears `Game::boss`.
+  crystals, score by tier and pace, and heals one heart, then takes the
+  `pending_clear` path into the shop, which clears `Game::boss`. Running out
+  of time (`boss_timeout`) ends the run outright: lives go to 0 with no Ward or
+  Second Wind, the phase goes to `Dying` (long enough to watch the boss float
+  away), and `boss_escaped` keeps the demanded WPM for the game-over popup.
 - **Layout.** With a boss the ship sits low (`ship_center`), the boss rests at
   `boss_home` and is drawn at `boss_pos` (home plus `boss::drift`, driven by
   `Boss::age`, so lasers and aiming follow it), and the passage panel is laid
@@ -166,6 +279,41 @@ test. `begin_wave` calls `start_boss`, which sets `Game::boss`; while it is
 - **Tuning.** Cadence, pace, passage length, pay and the timeout penalty are
   constants and small functions in `boss.rs` and the `boss_*` methods in
   `game.rs`. Add a test when you change one.
+
+## Sound
+
+`audio.rs` synthesizes every effect from a recipe of tones (pulse,
+triangle and noise voices with exponential pitch sweeps): no crates, no
+sound files. `Audio::start()` runs a mixer thread that streams raw mono
+16-bit PCM at `RATE` into the first player that works (`pw-cat`, `pacat`,
+`aplay`), paced `LEAD` ahead of the wall clock so effects land within a few
+tens of milliseconds. With no player the game is silent; nothing errors.
+
+- The simulation only queues: `Game::sfx(Sfx)` / `sfx_after(Sfx, delay)`
+  push onto `Game::sounds` (at most three of one sound per frame), and
+  `main.rs` drains it each frame into `Audio::play` with
+  `settings.sound.factor()` (FULL / LOW / OFF in Options). Tests assert on
+  `game.sounds`; they never open a player.
+- Hooks: selection moves (`menu_move`, `shop_move`, `hover`, ...) tick
+  `Hover`; Enter on a menu plays `Select` (in `main.rs`); each correct
+  letter plays `Fire(position)`; `slip` plays `Typo`; `detonate` plays
+  `Break` and, for a word typed without a slip (`!fumbled`), `Perfect`;
+  shop buys, denials and rerolls, hearts lost, waves, the boss and
+  Overdrive each have their own.
+- New effect: add an `Sfx` variant and its `recipe`, keep it under 1.5 s,
+  and add it to the `ALL` list in `audio.rs`'s tests.
+
+## Mouse
+
+`main.rs` enables mouse capture. While drawing, every clickable thing calls
+`mark(area, Hit)` into a per-frame list (the `HITS` thread-local in
+`draw.rs`); `draw::hit_at(x, y)` returns the topmost hit. Moving the mouse
+calls `Game::hover(hit)`, which selects it only if that screen is live (a
+shop under the pause menu is not). A left click hovers and then sends Enter
+through `on_key`, so input locks and phase rules apply unchanged; the
+MY UPGRADES / BACK buttons send Tab, and upgrade rows only select (selling
+needs Enter or the SELL button). When you add a menu, button or card, mark
+it and extend `Hit`/`hover`.
 
 ## Rendering rules
 
@@ -227,8 +375,13 @@ the things the player acts on carry color. Hold to this when adding visuals.
   with `wrap`; never let text spill past a card's inner width.
 - **Words are chips.** `draw_label` paints every word on a `pal.chip`
   background with one padding cell on each side. The locked word gets a warmer
-  chip and `‹ ›` brackets instead of padding. Do not draw bare words over the
-  braille layer.
+  chip and `‹ ›` brackets instead of padding; a word that would extend the
+  link shows `∘` in its left pad; elites put their mark (`÷ » ×2 ? ◆`) in
+  front of the chip. Do not draw bare words over the braille layer.
+- **Arcade dressing stays in text rows.** Call-outs (`bigtext::draw_text`)
+  sit in the middle of the play area for a second; the announcer uses play
+  row 1; the Overdrive meter is the stage floor line. None of it adds HUD
+  rows. Scanlines darken odd rows in the background painters only.
 - **One shape per job, themes only recolor.** Projectiles go through
   `draw_projectile` (dash plus three-dot tail) and `projectile_colors`.
   Space and Underwater explosions are `Game::burst` (one ring, six shards).
@@ -328,13 +481,24 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
   helper and assert on the resulting text (e.g. menu labels and hint copy).
   Add a render assertion when you add player-visible strings or theme visuals.
 - Every behavior change should add or update a focused test. Keep the suite
-  green; currently 70 tests.
+  green; currently 133 tests (plus two ignored reports).
+- `cargo test --release frame_cost -- --ignored --nocapture` prints the
+  frame cost per theme (and ratatui's own empty-frame cost). Put before and
+  after numbers in performance commits.
+- `cargo test --release balance_report -- --ignored --nocapture` runs the
+  balance bot (`bot_run`): a perfect typist at 4, 5.5 and 7 letters per
+  second who buys the cheapest card. Set `BOT_TRACE=1` for per-wave detail.
+  Rough targets: 4 cps dies around waves 7-11, 7 cps wins; about 10-16 tiers
+  held by wave 10. `a_steady_typist_cannot_buy_the_whole_catalog_by_wave_ten`
+  guards the economy.
 
 ## Gotchas
 
 - Frame pacing lives in `main.rs`: update, then `present` (a synchronized
   update, DEC mode 2026, so frames never tear), then wait for input until the
-  next `FRAME` deadline (120 fps). A keypress cuts the wait short so typing
+  next deadline: `Game::frame_budget()` (120 fps in play and on the title, 30
+  fps on still screens), or 10 fps while the terminal is unfocused (focus
+  events also pause play). A keypress cuts the wait short so typing
   shows at once. A frame costs well under 1 ms; keep it that way, since the
   whole budget is 8 ms. Do not go back to drawing before updating or to a
   fixed sleep after drawing; both read as lag.
@@ -358,3 +522,7 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
   through rather than being destroyed for free.
 - Don't put gameplay elements at braille priority `0`; they would be
   overpainted by background scenery.
+- The crate targets Rust 1.75: do not take clippy's `is_multiple_of`
+  suggestion (1.87+); write `n / k * k == n` or `n % k < 1` instead.
+- The jungle canopy is cached per size and scanline setting (`CANOPY`
+  thread-local in `draw.rs`); `paint_jungle_canopy` only copies it.
