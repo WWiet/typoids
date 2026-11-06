@@ -44,7 +44,7 @@ There is no separate lint config and no CI; `-D warnings` is the standard.
 | `src/game/fun.rs` | Overdrive, hit-stop, word links, elite behavior (crack, split), power-ups. |
 | `src/game/pointer.rs` | Mouse targets (`Hit`) and `hover()`, which selects one only if its screen is up. |
 | `src/game/rack.rs` | Rack slots and selling, shop inflation, flawless bonus, `hazard_pace()`. |
-| `src/audio.rs` | Sound: `Sfx` list, synthesized recipes, the `Mixer`, and the thread that streams PCM to `pw-cat`/`pacat`/`aplay`. |
+| `src/audio.rs` | Sound: `Sfx` list, synthesized recipes, the `Mixer`, and the `Audio` handle. Output lives in `audio/pipe.rs` (Linux: PCM into `pw-cat`/`pacat`/`aplay`) and `audio/device.rs` (Mac and Windows: `cpal`). |
 | `src/hazards.rs` | Elite `Kind`s, the `ELITES` table, `Pickup`s. Data only. |
 | `src/scores.rs` | High-score table and daily best: pure `encode`/`decode`, `date_label`. |
 | `src/settings.rs` | `Settings` (scanlines, shake, reduced motion, heat): pure `encode`/`decode`. |
@@ -283,11 +283,23 @@ test. `begin_wave` calls `start_boss`, which sets `Game::boss`; while it is
 ## Sound
 
 `audio.rs` synthesizes every effect from a recipe of tones (pulse,
-triangle and noise voices with exponential pitch sweeps): no crates, no
-sound files. `Audio::start()` runs a mixer thread that streams raw mono
-16-bit PCM at `RATE` into the first player that works (`pw-cat`, `pacat`,
-`aplay`), paced `LEAD` ahead of the wall clock so effects land within a few
-tens of milliseconds. With no player the game is silent; nothing errors.
+triangle and noise voices with exponential pitch sweeps): no sound files.
+`Audio::start()` runs a sound thread whose output depends on the system:
+
+- **Linux** (`audio/pipe.rs`): raw mono 16-bit PCM at `RATE` into the first
+  player that works (`pw-cat`, `pacat`, `aplay`), paced `LEAD` ahead of the
+  wall clock. No crate, so Linux builds need no ALSA headers.
+- **Mac and Windows** (`audio/device.rs`): `cpal` 0.16, a dependency only
+  for non-Linux targets in `Cargo.toml`. The default device chooses rate,
+  format and channels; `Mixer::new(rate)` renders mono at that rate and the
+  callback copies it to every channel. 0.16 is pinned on purpose: its Mac
+  backend is pure Rust (no bindgen or SDK headers), and later versions need
+  a newer Rust.
+
+With no working output the game is silent; nothing errors. Check other
+systems from Linux with `cargo clippy --target x86_64-pc-windows-msvc`
+(and `aarch64-apple-darwin`) after `rustup target add`; that type-checks
+but cannot link or play.
 
 - The simulation only queues: `Game::sfx(Sfx)` / `sfx_after(Sfx, delay)`
   push onto `Game::sounds` (at most three of one sound per frame), and
@@ -481,7 +493,7 @@ Tests are colocated in `#[cfg(test)] mod tests` inside `game.rs` and `draw.rs`.
   helper and assert on the resulting text (e.g. menu labels and hint copy).
   Add a render assertion when you add player-visible strings or theme visuals.
 - Every behavior change should add or update a focused test. Keep the suite
-  green; currently 133 tests (plus two ignored reports).
+  green; currently 134 tests (plus two ignored reports).
 - `cargo test --release frame_cost -- --ignored --nocapture` prints the
   frame cost per theme (and ratatui's own empty-frame cost). Put before and
   after numbers in performance commits.

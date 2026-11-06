@@ -16,3 +16,8 @@ ratatui = "0.29"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Mac and Windows play sound through cpal; Linux pipes to the system player
+# (see src/audio.rs), so Linux builds need no audio crate or ALSA headers.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = "0.16"

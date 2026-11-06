@@ -15,7 +15,7 @@ Rust 1.75 or newer. The terminal should be at least 70×22 and speak UTF-8 (brai
 
 ## Sound
 
-The game makes chiptune sound effects for menus, typing, breaking hazards, perfect words, the shop, the boss and more. They are generated in code and played through `pw-cat`, `pacat` or `aplay`, whichever your system has (PipeWire, PulseAudio or plain ALSA). Turn them down or off under **Options › SOUND**.
+The game makes chiptune sound effects for menus, typing, breaking hazards, perfect words, the shop, the boss and more. They are generated in code. On Linux they play through `pw-cat`, `pacat` or `aplay`, whichever your system has (PipeWire, PulseAudio or plain ALSA); on Mac and Windows they go straight to the system audio. Turn them down or off under **Options › SOUND**.
 
 ## The title screen
 

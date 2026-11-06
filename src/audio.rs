@@ -1,25 +1,27 @@
-//! Sound effects, with no crates and no sound files.
+//! Sound effects, with no sound files.
 //!
 //! Every effect is a short recipe of chiptune tones (square, triangle and
-//! noise voices with pitch sweeps). A background thread mixes the voices
-//! that are playing and streams raw 16-bit mono PCM into the first system
-//! player that works (`pw-cat`, `pacat`, then `aplay`). If none does, the
-//! game stays silent. `game.rs` only queues `Sfx` values (`Game::sounds`);
-//! `main.rs` hands them to `Audio::play`.
+//! noise voices with pitch sweeps), mixed by `Mixer` on a background thread.
+//! Getting the samples to the speakers depends on the system:
+//!
+//! - Linux (`pipe.rs`): raw 16-bit mono PCM into the first system player
+//!   that works (`pw-cat`, `pacat`, then `aplay`). No crates needed.
+//! - Mac and Windows (`device.rs`): the `cpal` crate, straight to CoreAudio
+//!   or WASAPI.
+//!
+//! Without a working output the game stays silent. `game.rs` only queues
+//! `Sfx` values (`Game::sounds`); `main.rs` hands them to `Audio::play`.
 
-use std::io::Write;
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
 
-/// Samples per second of the stream.
+#[cfg(not(target_os = "linux"))]
+mod device;
+#[cfg(target_os = "linux")]
+mod pipe;
+
+/// Samples per second when the output does not choose (the Linux pipe).
 pub const RATE: u32 = 32_000;
-/// Samples mixed per write: 8 ms.
-const CHUNK: usize = 256;
-/// How far the mixer runs ahead of the wall clock. Short, so a key press
-/// is heard almost at once, but long enough not to stutter.
-const LEAD: f64 = 0.035;
 /// Voices beyond this are dropped (oldest first) so bursts stay clean.
 const MAX_VOICES: usize = 24;
 
@@ -219,9 +221,8 @@ impl Voice {
         self.t >= self.tone.dur
     }
 
-    /// The next sample, in -1..1 before volume.
-    fn sample(&mut self) -> f32 {
-        let dt = 1.0 / RATE as f32;
+    /// The next sample, in -1..1 before volume, `dt` seconds on.
+    fn sample(&mut self, dt: f32) -> f32 {
         let t = self.t;
         self.t += dt;
         if t < 0.0 || t >= self.tone.dur {
@@ -265,19 +266,41 @@ pub struct Mixer {
     voices: Vec<Voice>,
     seed: u32,
     smooth: f32,
+    /// Seconds per sample at the output's rate.
+    dt: f32,
+    /// Low-pass strength, scaled so it sounds the same at any rate.
+    alpha: f32,
 }
 
 impl Default for Mixer {
     fn default() -> Self {
-        Mixer {
-            voices: Vec::new(),
-            seed: 0x9E37_79B9,
-            smooth: 0.0,
-        }
+        Mixer::new(RATE)
     }
 }
 
 impl Mixer {
+    pub fn new(rate: u32) -> Self {
+        Mixer {
+            voices: Vec::new(),
+            seed: 0x9E37_79B9,
+            smooth: 0.0,
+            dt: 1.0 / rate.max(1) as f32,
+            // 0.55 per sample at 32 kHz, the same cutoff elsewhere.
+            alpha: 1.0 - 0.45f32.powf(RATE as f32 / rate.max(1) as f32),
+        }
+    }
+
+    /// Take every waiting request. Returns false once the game has hung up.
+    pub fn take_requests(&mut self, rx: &Receiver<Request>) -> bool {
+        loop {
+            match rx.try_recv() {
+                Ok((sfx, delay, volume)) => self.trigger(sfx, delay, volume),
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        }
+    }
+
     /// Start `sfx` after `delay` seconds at `volume` (0 to 1).
     pub fn trigger(&mut self, sfx: Sfx, delay: f32, volume: f32) {
         for mut tone in recipe(sfx) {
@@ -299,76 +322,38 @@ impl Mixer {
         self.voices.is_empty()
     }
 
-    /// Fill `out` with the next samples.
+    /// The next mixed sample, -1 to 1.
+    fn next(&mut self) -> f32 {
+        let dt = self.dt;
+        let mut x: f32 = self.voices.iter_mut().map(|v| v.sample(dt)).sum();
+        // Soft clip (a tanh curve), then a gentle low-pass to take the edge
+        // off the square waves.
+        x = x * (27.0 + x * x) / (27.0 + 9.0 * x * x);
+        self.smooth += self.alpha * (x - self.smooth);
+        self.smooth.clamp(-1.0, 1.0)
+    }
+
+    /// Fill `out` with the next samples, as 16-bit PCM.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub fn render(&mut self, out: &mut [i16]) {
         for s in out.iter_mut() {
-            let mut x: f32 = self.voices.iter_mut().map(Voice::sample).sum();
-            // Soft clip (a tanh curve), then a gentle low-pass to take the
-            // edge off the square waves.
-            x = x * (27.0 + x * x) / (27.0 + 9.0 * x * x);
-            self.smooth += 0.55 * (x - self.smooth);
-            *s = (self.smooth.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            *s = (self.next() * i16::MAX as f32) as i16;
+        }
+        self.voices.retain(|v| !v.done());
+    }
+
+    /// Fill `out` with the next samples, as floats.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub fn render_f32(&mut self, out: &mut [f32]) {
+        for s in out.iter_mut() {
+            *s = self.next();
         }
         self.voices.retain(|v| !v.done());
     }
 }
 
-/// Players to try, in order, each reading raw mono s16 PCM on stdin.
-fn players() -> [Vec<String>; 3] {
-    let rate = RATE.to_string();
-    let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    [
-        args(&[
-            "pw-cat",
-            "--playback",
-            "--raw",
-            "--rate",
-            &rate,
-            "--channels",
-            "1",
-            "--format",
-            "s16",
-            "--latency",
-            "15ms",
-            "-",
-        ]),
-        args(&[
-            "pacat",
-            "--playback",
-            "--raw",
-            &format!("--rate={rate}"),
-            "--channels=1",
-            "--format=s16le",
-            "--latency-msec=25",
-        ]),
-        args(&[
-            "aplay",
-            "-q",
-            "-t",
-            "raw",
-            "-f",
-            "S16_LE",
-            "-r",
-            &rate,
-            "-c",
-            "1",
-            "--buffer-time=40000",
-        ]),
-    ]
-}
-
-fn spawn(cmd: &[String]) -> Option<Child> {
-    Command::new(&cmd[0])
-        .args(&cmd[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
-}
-
 /// A sound request: what, after how long, how loud.
-type Request = (Sfx, f32, f32);
+pub type Request = (Sfx, f32, f32);
 
 /// The game's handle on the sound thread. Dropping it stops the sound.
 pub struct Audio {
@@ -381,7 +366,7 @@ impl Audio {
         let (tx, rx) = mpsc::channel();
         let ok = thread::Builder::new()
             .name("typoids-audio".into())
-            .spawn(move || run(rx))
+            .spawn(move || output(rx))
             .is_ok();
         Audio {
             tx: ok.then_some(tx),
@@ -398,57 +383,12 @@ impl Audio {
     }
 }
 
-/// The mixer thread: find a player, then stream until the game quits.
-fn run(rx: Receiver<Request>) {
-    for cmd in players() {
-        let Some(mut child) = spawn(&cmd) else {
-            continue;
-        };
-        let started = Instant::now();
-        let streamed = stream(&mut child, &rx);
-        let _ = child.kill();
-        let _ = child.wait();
-        // A player that dies at once is missing a server: try the next.
-        // One that ran a while and stopped means the game is quitting.
-        if streamed || started.elapsed() > Duration::from_secs(1) {
-            return;
-        }
-    }
-}
-
-/// Feed the player, paced to the wall clock. Returns true when the game
-/// hung up (normal exit), false when the player stopped taking samples.
-fn stream(child: &mut Child, rx: &Receiver<Request>) -> bool {
-    let Some(mut pipe) = child.stdin.take() else {
-        return false;
-    };
-    let mut mixer = Mixer::default();
-    let mut buf = [0i16; CHUNK];
-    let mut bytes = [0u8; CHUNK * 2];
-    let start = Instant::now();
-    let mut written: u64 = 0;
-    loop {
-        loop {
-            match rx.try_recv() {
-                Ok((sfx, delay, volume)) => mixer.trigger(sfx, delay, volume),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return true,
-            }
-        }
-        let ahead = written as f64 / RATE as f64 - start.elapsed().as_secs_f64();
-        if ahead > LEAD {
-            thread::sleep(Duration::from_secs_f64((ahead - LEAD).min(0.02)));
-            continue;
-        }
-        mixer.render(&mut buf);
-        for (i, s) in buf.iter().enumerate() {
-            bytes[i * 2..i * 2 + 2].copy_from_slice(&s.to_le_bytes());
-        }
-        if pipe.write_all(&bytes).is_err() {
-            return false;
-        }
-        written += CHUNK as u64;
-    }
+/// The sound thread: play through this system's output until the game quits.
+fn output(rx: Receiver<Request>) {
+    #[cfg(target_os = "linux")]
+    pipe::run(rx);
+    #[cfg(not(target_os = "linux"))]
+    device::run(rx);
 }
 
 #[cfg(test)]
@@ -487,7 +427,7 @@ mod tests {
             assert!(end > 0.0 && end < 1.5, "{sfx:?} lasts {end}s");
             let mut m = Mixer::default();
             m.trigger(sfx, 0.0, 1.0);
-            let mut out = vec![0i16; (end * RATE as f32) as usize + CHUNK];
+            let mut out = vec![0i16; (end * RATE as f32) as usize + 256];
             m.render(&mut out);
             let peak = out.iter().map(|s| s.unsigned_abs()).max().unwrap();
             assert!(peak > 500, "{sfx:?} is silent");
@@ -506,6 +446,25 @@ mod tests {
         m.render(&mut out);
         // The soft clip keeps the stack below full scale.
         assert!(out.iter().all(|s| s.unsigned_abs() < i16::MAX as u16));
+    }
+
+    #[test]
+    fn effects_last_as_long_at_a_device_rate() {
+        // Mac and Windows devices usually run at 48 kHz; the pipe at 32.
+        let length = |rate: u32| {
+            let mut m = Mixer::new(rate);
+            m.trigger(Sfx::Perfect, 0.0, 1.0);
+            let mut chunk = vec![0f32; rate as usize / 100];
+            let mut loud = 0;
+            for _ in 0..100 {
+                m.render_f32(&mut chunk);
+                loud += chunk.iter().filter(|s| s.abs() > 0.01).count();
+            }
+            assert!(m.idle());
+            loud as f32 / rate as f32
+        };
+        let (pipe, device) = (length(RATE), length(48_000));
+        assert!((pipe - device).abs() < 0.02, "{pipe}s vs {device}s");
     }
 
     #[test]
